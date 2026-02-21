@@ -104,6 +104,66 @@ const TRIP_API_BASE = 'http://localhost:3000';
  */
 const TRIP_NOISE_PENALTY = 2;
 
+/* ── Road data cache (localStorage) ─────────────────────────────── */
+
+/** localStorage key prefix for cached road data. */
+const ROAD_CACHE_PREFIX  = '4w_roads_';
+/** Time-to-live for cached road data: 24 hours. */
+const ROAD_CACHE_TTL_MS  = 24 * 60 * 60 * 1000;
+
+/**
+ * Build a deterministic localStorage key for the given map bounds.
+ * Coordinates are rounded to 4 decimal places (~11 m) so that
+ * re-analysing the identical view always produces a cache hit.
+ * @param {L.LatLngBounds} bounds
+ * @returns {string}
+ */
+function roadCacheKey(bounds) {
+  const s = bounds.getSouth().toFixed(4);
+  const w = bounds.getWest().toFixed(4);
+  const n = bounds.getNorth().toFixed(4);
+  const e = bounds.getEast().toFixed(4);
+  return `${ROAD_CACHE_PREFIX}${s},${w},${n},${e}`;
+}
+
+/**
+ * Return cached road ways for the given bounds, or null on a miss /
+ * expired entry.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Array|null}
+ */
+function getCachedRoads(bounds) {
+  try {
+    const raw = localStorage.getItem(roadCacheKey(bounds));
+    if (!raw) return null;
+    const { ways, cachedAt } = JSON.parse(raw);
+    if (Date.now() - cachedAt > ROAD_CACHE_TTL_MS) {
+      localStorage.removeItem(roadCacheKey(bounds));
+      return null;
+    }
+    return ways;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist road ways in localStorage for the given bounds.
+ * Silently no-ops when storage is unavailable or full.
+ * @param {L.LatLngBounds} bounds
+ * @param {Array} ways
+ */
+function setCachedRoads(bounds, ways) {
+  try {
+    localStorage.setItem(
+      roadCacheKey(bounds),
+      JSON.stringify({ ways, cachedAt: Date.now() })
+    );
+  } catch {
+    /* Storage quota exceeded or unavailable – fail silently */
+  }
+}
+
 /**
  * Register the current map view as an anonymous planned trip.
  * Failures are surfaced to the user but do not block other functionality.
@@ -260,7 +320,44 @@ async function runAnalysis() {
 }
 
 /* ── Overpass API ────────────────────────────────────────────────── */
+
+/**
+ * Fetch road ways for the given bounds using a three-tier strategy:
+ *  1. On-device localStorage cache (instant, survives app restarts)
+ *  2. Backend road cache  (shared across users, only calls Overpass on miss)
+ *  3. Direct Overpass API (fallback when backend is unreachable)
+ *
+ * Successful responses from tier 2 or 3 are stored in localStorage
+ * so the next request in the same session is served from tier 1.
+ *
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} Overpass way elements
+ */
 async function fetchRoads(bounds) {
+  /* ── Tier 1: on-device cache ──────────────────────────────────── */
+  const cached = getCachedRoads(bounds);
+  if (cached) return cached;
+
+  /* ── Tier 2: backend road cache ───────────────────────────────── */
+  const params = new URLSearchParams({
+    south: bounds.getSouth().toFixed(6),
+    west:  bounds.getWest().toFixed(6),
+    north: bounds.getNorth().toFixed(6),
+    east:  bounds.getEast().toFixed(6),
+  });
+  try {
+    const resp = await fetch(`${TRIP_API_BASE}/api/roads?${params}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const ways = data.ways || [];
+      setCachedRoads(bounds, ways);
+      return ways;
+    }
+  } catch {
+    /* Backend unavailable – fall through to direct Overpass */
+  }
+
+  /* ── Tier 3: direct Overpass API ──────────────────────────────── */
   const s = bounds.getSouth().toFixed(6);
   const w = bounds.getWest().toFixed(6);
   const n = bounds.getNorth().toFixed(6);
@@ -282,7 +379,9 @@ async function fetchRoads(bounds) {
 
   if (!resp.ok) throw new Error(`Overpass returned HTTP ${resp.status}`);
   const data = await resp.json();
-  return data.elements || [];
+  const ways = data.elements || [];
+  setCachedRoads(bounds, ways);
+  return ways;
 }
 
 /* ── Noise computation ───────────────────────────────────────────── */
