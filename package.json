@@ -4,6 +4,7 @@
   "description": "Silent Place Finder – find the quietest spots near you",
   "private": true,
   "scripts": {
+    "start": "node server.js",
     "prepare:android": "rm -rf www && mkdir www && cp index.html app.js style.css www/ && cp -r lib www/",
     "android": "npx cap run android",
     "build:android": "npm run prepare:android && npx cap sync android && cd android && ./gradlew assembleDebug",
