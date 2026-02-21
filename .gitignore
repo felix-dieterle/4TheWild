@@ -1,3 +1,13 @@
 node_modules/
 *.log
 .DS_Store
+
+# Android build artifacts
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+
+# Generated web assets directory for Capacitor
+www/
+

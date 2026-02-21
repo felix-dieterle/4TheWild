@@ -49,6 +49,42 @@ Pan & zoom the map to your area of interest, then click **Analyze Current View**
 > **Tip:** Use a zoom level of 10–13 for best results.  
 > Very large areas may time out due to Overpass API limits.
 
+## Android APK build
+
+The app is wrapped with [Capacitor](https://capacitorjs.com/) to produce a native Android APK.
+
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) ≥ 18
+- [Android Studio](https://developer.android.com/studio) with JDK 21 (Capacitor 7 requires Java 21 source compatibility)
+
+### Build steps
+
+```bash
+# 1. Install Capacitor dependencies
+npm install
+
+# 2. Copy web assets into the www/ staging directory (required by Capacitor)
+npm run prepare:android
+
+# 3. Create the Android native project (only needed once)
+npx cap add android
+
+# 4. Sync web assets into the Android project
+npx cap sync android
+
+# 5a. Open in Android Studio and build / run from there
+npx cap open android
+
+# 5b. OR build the debug APK from the command line
+cd android && ./gradlew assembleDebug
+# → APK is at android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+### CI / automated build
+
+A GitHub Actions workflow (`.github/workflows/android-build.yml`) builds a debug APK on every push to `main` and on pull requests. The APK is uploaded as a workflow artifact (retained for 30 days).
+
 ## Tech stack
 
 - [Leaflet.js 1.9](https://leafletjs.com/) – map rendering
