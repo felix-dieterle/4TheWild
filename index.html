@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>4TheWild – Silent Place Finder</title>
+  <link rel="stylesheet" href="lib/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ── Sidebar ───────────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <header id="branding">
+        <span class="logo">🌿</span>
+        <div>
+          <h1>4TheWild</h1>
+          <p>Silent Place Finder</p>
+        </div>
+      </header>
+
+      <!-- Analyze -->
+      <section class="card">
+        <h2>Analyze Area</h2>
+        <p class="hint">
+          Pan &amp; zoom the map to your region of interest, then click
+          <strong>Analyze</strong> to compute the noise heatmap.
+        </p>
+        <button id="analyzeBtn">🔍 Analyze Current View</button>
+        <div id="status" class="status hidden"></div>
+      </section>
+
+      <!-- Heatmap options -->
+      <section class="card">
+        <h2>Heatmap</h2>
+        <label class="slider-label">
+          Opacity
+          <input type="range" id="opacitySlider" min="0.1" max="1" step="0.05" value="0.65" />
+          <span id="opacityVal">65%</span>
+        </label>
+        <label class="slider-label">
+          Blur radius
+          <input type="range" id="blurSlider" min="5" max="40" step="1" value="20" />
+          <span id="blurVal">20</span>
+        </label>
+        <div class="legend">
+          <span class="legend-item quiet">Quiet</span>
+          <div class="legend-bar"></div>
+          <span class="legend-item noisy">Noisy</span>
+        </div>
+      </section>
+
+      <!-- Road weights -->
+      <section class="card" id="weightsCard">
+        <h2>Road Noise Weights</h2>
+        <p class="hint">Adjust how much each road type contributes to noise.</p>
+        <div id="weightControls"></div>
+      </section>
+
+      <!-- Results -->
+      <section class="card hidden" id="resultsCard">
+        <h2>🏆 Quietest Spots</h2>
+        <ol id="resultsList"></ol>
+      </section>
+
+      <footer>
+        Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>
+      </footer>
+    </aside>
+
+    <!-- ── Map ──────────────────────────────────────────────────── -->
+    <div id="map"></div>
+  </div>
+
+  <script src="lib/leaflet.js"></script>
+  <script src="lib/leaflet-heat.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
