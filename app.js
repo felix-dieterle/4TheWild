@@ -6,9 +6,14 @@
  * typical traffic noise. The grid-based score for a point is:
  *
  *   noiseScore(p) = max over all segments s { weight(s) * 1000 / dist(p, s) }
+ *                  + tripCount(p) * TRIP_NOISE_PENALTY
  *
- * High score → noisy (close to a busy road).
- * Low score  → quiet (far from roads or only near minor tracks).
+ * tripCount(p) is the number of active anonymous trip plans whose bounding
+ * box contains p. Each planned trip reduces the silence score of the area,
+ * signalling to other users that it will be less quiet when they arrive.
+ *
+ * High score → noisy / crowded (avoid).
+ * Low score  → quiet / uncrowded (ideal).
  */
 
 /* ── Road type noise weights (higher = louder) ──────────────────── */
@@ -47,10 +52,11 @@ const WEIGHT_UI_GROUPS = [
 ];
 
 /* ── State ───────────────────────────────────────────────────────── */
-let roadWeights = { ...DEFAULT_ROAD_WEIGHTS };
-let heatLayer   = null;
+let roadWeights  = { ...DEFAULT_ROAD_WEIGHTS };
+let heatLayer    = null;
 let quietMarkers = [];
-let analyzing   = false;
+let tripRects    = []; /* Leaflet rectangles for planned trip areas */
+let analyzing    = false;
 
 /* ── Map initialisation ──────────────────────────────────────────── */
 const map = L.map('map', { zoomControl: true }).setView([47.55, 8.05], 11);
@@ -78,6 +84,84 @@ const blurVal       = document.getElementById('blurVal');
 const weightControls= document.getElementById('weightControls');
 const resultsCard   = document.getElementById('resultsCard');
 const resultsList   = document.getElementById('resultsList');
+const planTripBtn   = document.getElementById('planTripBtn');
+const tripStatusEl  = document.getElementById('tripStatus');
+
+/* ── Trip planning ───────────────────────────────────────────────── */
+
+/**
+ * Base URL for the trip-planning backend.
+ * Change this to the deployed server URL in production.
+ */
+const TRIP_API_BASE = 'http://localhost:3000';
+
+/**
+ * Noise penalty added per planned trip that overlaps a grid point.
+ * Using the formula  noise = weight × 1000 / dist  with weight = 1
+ * (unclassified road), a penalty of 2 is equivalent to standing ~500 m
+ * from that road type.  This makes heavily-planned areas noticeably less
+ * "silent" without overwhelming the road-noise contribution.
+ */
+const TRIP_NOISE_PENALTY = 2;
+
+/**
+ * Register the current map view as an anonymous planned trip.
+ * Failures are surfaced to the user but do not block other functionality.
+ */
+async function planTrip() {
+  const bounds = map.getBounds();
+  const payload = {
+    south: bounds.getSouth(),
+    west:  bounds.getWest(),
+    north: bounds.getNorth(),
+    east:  bounds.getEast(),
+  };
+
+  planTripBtn.disabled = true;
+  showTripStatus('⏳ Registering trip…', 'info');
+
+  try {
+    const resp = await fetch(`${TRIP_API_BASE}/api/trips`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(`Server returned HTTP ${resp.status}`);
+    showTripStatus('✅ Trip planned! Others in this area will see an adjusted silence score.', 'success');
+  } catch (err) {
+    console.warn('Trip planning unavailable:', err.message);
+    showTripStatus('⚠️ Trip server unavailable. Your plan was not saved.', 'error');
+  } finally {
+    planTripBtn.disabled = false;
+  }
+}
+
+/**
+ * Fetch planned trips that overlap the given bounds from the backend.
+ * Returns an empty array when the server is unreachable so that the rest
+ * of the analysis can proceed unaffected.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array<{south:number,west:number,north:number,east:number}>>}
+ */
+async function fetchPlannedTrips(bounds) {
+  const params = new URLSearchParams({
+    south: bounds.getSouth(),
+    west:  bounds.getWest(),
+    north: bounds.getNorth(),
+    east:  bounds.getEast(),
+  });
+  try {
+    const resp = await fetch(`${TRIP_API_BASE}/api/trips?${params}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    return data.trips || [];
+  } catch (err) {
+    console.warn('Could not fetch planned trips:', err.message);
+    return [];
+  }
+}
+
+planTripBtn.addEventListener('click', planTrip);
 
 /* ── Build weight sliders ────────────────────────────────────────── */
 WEIGHT_UI_GROUPS.forEach(group => {
@@ -133,25 +217,33 @@ async function runAnalysis() {
 
   try {
     const bounds = map.getBounds();
-    const ways   = await fetchRoads(bounds);
+    const [ways, plannedTrips] = await Promise.all([
+      fetchRoads(bounds),
+      fetchPlannedTrips(bounds),
+    ]);
 
     if (!ways.length) {
       showStatus('⚠️ No road data found in this area. Try zooming in or panning.', 'error');
       return;
     }
 
-    showStatus(`🧮 Calculating noise scores for ${ways.length} roads…`, 'info');
+    const tripNote = plannedTrips.length
+      ? ` (${plannedTrips.length} trip${plannedTrips.length > 1 ? 's' : ''} planned here – silence score adjusted)`
+      : '';
+    showStatus(`🧮 Calculating noise scores for ${ways.length} roads…${tripNote}`, 'info');
 
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
-    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds);
+    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips);
 
     renderHeatmap(heatPoints);
+    renderTripRects(plannedTrips);
     renderResults(quietestPoints);
 
     showStatus(
-      `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.`,
+      `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
+      (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : ''),
       'success'
     );
   } catch (err) {
@@ -200,7 +292,7 @@ const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort wi
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
 
-function computeHeatmap(ways, bounds) {
+function computeHeatmap(ways, bounds, plannedTrips = []) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
@@ -256,6 +348,14 @@ function computeHeatmap(ways, bounds) {
         const noise = seg.weight * 1000 / dist;
         if (noise > noiseScore) noiseScore = noise;
       }
+
+      /* Add a penalty for each planned trip whose bbox covers this point.
+         This reduces the effective silence score of areas that are already
+         planned by other users. */
+      const tripCount = plannedTrips.filter(t =>
+        lat >= t.south && lat <= t.north && lng >= t.west && lng <= t.east
+      ).length;
+      noiseScore += tripCount * TRIP_NOISE_PENALTY;
 
       if (noiseScore > maxNoise) maxNoise = noiseScore;
       gridScores.push({ lat, lng, noiseScore });
@@ -365,11 +465,45 @@ function renderResults(points) {
   });
 }
 
+/* ── Trip rect rendering ─────────────────────────────────────────── */
+
+/**
+ * Draw semi-transparent rectangles on the map for each planned trip area,
+ * so users can see which regions are already targeted by others.
+ * @param {Array<{south:number,west:number,north:number,east:number,id:string}>} trips
+ */
+function renderTripRects(trips) {
+  /* Remove previous rectangles */
+  tripRects.forEach(r => map.removeLayer(r));
+  tripRects = [];
+
+  trips.forEach(t => {
+    const rect = L.rectangle(
+      [[t.south, t.west], [t.north, t.east]],
+      {
+        color:     '#f59e0b',
+        weight:    1.5,
+        fillColor: '#f59e0b',
+        fillOpacity: 0.12,
+        dashArray: '4 4',
+      }
+    ).bindTooltip('Planned trip area – silence score adjusted')
+     .addTo(map);
+    tripRects.push(rect);
+  });
+}
+
 /* ── Helpers ─────────────────────────────────────────────────────── */
 function showStatus(msg, type = 'info') {
   statusEl.textContent = msg;
   statusEl.className = `status ${type}`;
   statusEl.classList.remove('hidden');
+}
+
+function showTripStatus(msg, type = 'info') {
+  tripStatusEl.textContent = msg;
+  tripStatusEl.className = `status ${type}`;
+  tripStatusEl.classList.remove('hidden');
 }
 
 function sleep(ms) {

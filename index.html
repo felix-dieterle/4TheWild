@@ -8,7 +8,7 @@
                  script-src 'self' 'unsafe-inline';
                  style-src 'self' 'unsafe-inline';
                  img-src 'self' data: blob: https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de;
-                 connect-src 'self' https://overpass-api.de https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de;" />
+                 connect-src 'self' https://overpass-api.de https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de http://localhost:3000;" />
   <title>4TheWild – Silent Place Finder</title>
   <link rel="stylesheet" href="lib/leaflet.css" />
   <link rel="stylesheet" href="style.css" />
@@ -24,6 +24,18 @@
           <p>Silent Place Finder</p>
         </div>
       </header>
+
+      <!-- Trip planning -->
+      <section class="card" id="tripCard">
+        <h2>🗺 Plan a Trip</h2>
+        <p class="hint">
+          Register your intention to visit the current map area. Other users
+          planning the same area will see a lower silence score, helping
+          everyone avoid unintentional overcrowding.
+        </p>
+        <button id="planTripBtn">📍 Plan Trip Here</button>
+        <div id="tripStatus" class="status hidden"></div>
+      </section>
 
       <!-- Analyze -->
       <section class="card">
