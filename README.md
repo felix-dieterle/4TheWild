@@ -64,16 +64,19 @@ The app is wrapped with [Capacitor](https://capacitorjs.com/) to produce a nativ
 # 1. Install Capacitor dependencies
 npm install
 
-# 2. Create the Android native project (only needed once)
+# 2. Copy web assets into the www/ staging directory (required by Capacitor)
+npm run prepare:android
+
+# 3. Create the Android native project (only needed once)
 npx cap add android
 
-# 3. Copy web assets into the Android project
+# 4. Sync web assets into the Android project
 npx cap sync android
 
-# 4a. Open in Android Studio and build / run from there
+# 5a. Open in Android Studio and build / run from there
 npx cap open android
 
-# 4b. OR build the debug APK from the command line
+# 5b. OR build the debug APK from the command line
 cd android && ./gradlew assembleDebug
 # → APK is at android/app/build/outputs/apk/debug/app-debug.apk
 ```

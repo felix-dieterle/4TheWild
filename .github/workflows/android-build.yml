@@ -29,6 +29,9 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Prepare web assets
+        run: npm run prepare:android
+
       - name: Add Android platform
         run: npx cap add android
 
