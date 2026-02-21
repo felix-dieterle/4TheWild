@@ -1,0 +1,8 @@
+{
+  "appId": "de.felixdieterle.forwild",
+  "appName": "4TheWild",
+  "webDir": ".",
+  "server": {
+    "androidScheme": "https"
+  }
+}

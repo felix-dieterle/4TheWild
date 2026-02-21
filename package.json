@@ -1,0 +1,19 @@
+{
+  "name": "4thewild",
+  "version": "1.0.0",
+  "description": "Silent Place Finder – find the quietest spots near you",
+  "private": true,
+  "scripts": {
+    "android": "npx cap run android",
+    "build:android": "npx cap sync android && cd android && ./gradlew assembleDebug",
+    "open:android": "npx cap open android",
+    "sync": "npx cap sync"
+  },
+  "dependencies": {
+    "@capacitor/android": "7.4.4",
+    "@capacitor/core": "7.4.4"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "7.4.4"
+  }
+}
