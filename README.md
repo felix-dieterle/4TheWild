@@ -56,7 +56,7 @@ The app is wrapped with [Capacitor](https://capacitorjs.com/) to produce a nativ
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) ≥ 18
-- [Android Studio](https://developer.android.com/studio) (includes the Android SDK and JDK 17)
+- [Android Studio](https://developer.android.com/studio) with JDK 21 (Capacitor 7 requires Java 21 source compatibility)
 
 ### Build steps
 
