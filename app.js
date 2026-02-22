@@ -59,7 +59,7 @@ let tripRects    = []; /* Leaflet rectangles for planned trip areas */
 let analyzing    = false;
 
 /* ── Map initialisation ──────────────────────────────────────────── */
-const map = L.map('map', { zoomControl: true }).setView([47.55, 8.05], 11);
+const map = L.map('map', { zoomControl: true }).setView([47.7728, 9.0883], 13);
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -75,17 +75,43 @@ if (navigator.geolocation) {
 }
 
 /* ── DOM refs ────────────────────────────────────────────────────── */
-const analyzeBtn    = document.getElementById('analyzeBtn');
-const statusEl      = document.getElementById('status');
-const opacitySlider = document.getElementById('opacitySlider');
-const opacityVal    = document.getElementById('opacityVal');
-const blurSlider    = document.getElementById('blurSlider');
-const blurVal       = document.getElementById('blurVal');
-const weightControls= document.getElementById('weightControls');
-const resultsCard   = document.getElementById('resultsCard');
-const resultsList   = document.getElementById('resultsList');
-const planTripBtn   = document.getElementById('planTripBtn');
-const tripStatusEl  = document.getElementById('tripStatus');
+const analyzeBtn      = document.getElementById('analyzeBtn');
+const statusEl        = document.getElementById('status');
+const opacitySlider   = document.getElementById('opacitySlider');
+const opacityVal      = document.getElementById('opacityVal');
+const blurSlider      = document.getElementById('blurSlider');
+const blurVal         = document.getElementById('blurVal');
+const weightControls  = document.getElementById('weightControls');
+const resultsCard     = document.getElementById('resultsCard');
+const resultsList     = document.getElementById('resultsList');
+const planTripBtn     = document.getElementById('planTripBtn');
+const tripStatusEl    = document.getElementById('tripStatus');
+const sidebarEl       = document.getElementById('sidebar');
+const sidebarToggleBtn= document.getElementById('sidebarToggle');
+const sidebarCloseBtn = document.getElementById('sidebarClose');
+const sidebarOverlay  = document.getElementById('sidebarOverlay');
+
+/* ── Mobile sidebar toggle ───────────────────────────────────────── */
+function openSidebar() {
+  sidebarEl.classList.remove('hidden-mobile');
+  sidebarOverlay.classList.remove('hidden');
+  sidebarToggleBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeSidebar() {
+  sidebarEl.classList.add('hidden-mobile');
+  sidebarOverlay.classList.add('hidden');
+  sidebarToggleBtn.setAttribute('aria-expanded', 'false');
+}
+
+sidebarToggleBtn.addEventListener('click', openSidebar);
+sidebarCloseBtn.addEventListener('click', closeSidebar);
+sidebarOverlay.addEventListener('click', closeSidebar);
+
+/* On mobile viewports, start with the sidebar closed so the map is front-and-center */
+if (window.matchMedia('(max-width: 480px)').matches) {
+  closeSidebar();
+}
 
 /* ── Trip planning ───────────────────────────────────────────────── */
 
@@ -273,6 +299,10 @@ async function runAnalysis() {
   if (analyzing) return;
   analyzing = true;
   analyzeBtn.disabled = true;
+  /* On mobile, close the sidebar so the map is fully visible */
+  if (window.matchMedia('(max-width: 480px)').matches) {
+    closeSidebar();
+  }
   showStatus('⏳ Fetching road data…', 'info');
 
   try {
