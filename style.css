@@ -200,20 +200,75 @@ footer {
 footer a { color: var(--accent2); text-decoration: none; }
 
 /* ── Responsive ─────────────────────────────────────────────────── */
+
+/* Sidebar toggle button (visible only on mobile) */
+#sidebarToggle {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 2000;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 1.2rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+}
+
+/* Close button inside sidebar header */
+#sidebarClose {
+  display: none;
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: 1rem;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+#sidebarClose:hover { color: var(--text); background: var(--bg); filter: none; }
+
 @media (max-width: 640px) {
-  :root { --sidebar-w: 260px; }
+  :root { --sidebar-w: 280px; }
 }
 @media (max-width: 480px) {
+  #sidebarToggle { display: flex; align-items: center; justify-content: center; }
+  #sidebarClose  { display: flex; align-items: center; justify-content: center; }
+
   #app { flex-direction: column; }
   #sidebar {
-    width: 100%;
-    min-width: unset;
-    height: auto;
-    max-height: 45vh;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
+    position: fixed;
+    top: 0; left: 0;
+    width: 85vw;
+    max-width: 320px;
+    height: 100%;
+    z-index: 1500;
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+    transition: transform 0.25s ease;
+    transform: translateX(0);
   }
-  #map { flex: 1; }
+  #sidebar.hidden-mobile {
+    transform: translateX(-100%);
+  }
+  /* Overlay behind open sidebar */
+  #sidebarOverlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    z-index: 1400;
+  }
+  #sidebarOverlay.hidden { display: none !important; }
+
+  #map { flex: 1; height: 100vh; }
 }
 
 /* ── Leaflet overrides ──────────────────────────────────────────── */
