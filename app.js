@@ -16,6 +16,26 @@
  * Low score  → quiet / uncrowded (ideal).
  */
 
+/* ── Vegetation noise-dampening factors (0 = no reduction, 1 = full) */
+const VEGETATION_DAMPENING = {
+  wood:      0.60, /* dense forest  */
+  forest:    0.60,
+  scrub:     0.35,
+  heath:     0.30,
+  wetland:   0.40,
+  grassland: 0.15,
+  meadow:    0.15,
+  grass:     0.10,
+  orchard:   0.25,
+  vineyard:  0.15,
+};
+
+/* Colours for the terrain accessibility overlay */
+const TERRAIN_COLORS = {
+  rough_track:     '#f59e0b', /* grade4/grade5 tracks */
+  demanding_trail: '#ef4444', /* mountain/alpine hiking */
+};
+
 /* ── Road type noise weights (higher = louder) ──────────────────── */
 const DEFAULT_ROAD_WEIGHTS = {
   motorway:         10,
@@ -52,11 +72,15 @@ const WEIGHT_UI_GROUPS = [
 ];
 
 /* ── State ───────────────────────────────────────────────────────── */
-let roadWeights  = { ...DEFAULT_ROAD_WEIGHTS };
-let heatLayer    = null;
-let quietMarkers = [];
-let tripRects    = []; /* Leaflet rectangles for planned trip areas */
-let analyzing    = false;
+let roadWeights     = { ...DEFAULT_ROAD_WEIGHTS };
+let heatLayer       = null;
+let quietMarkers    = [];
+let tripRects       = []; /* Leaflet rectangles for planned trip areas */
+let analyzing       = false;
+let locationMarker  = null; /* current-position marker */
+let locationCircle  = null; /* accuracy circle around current position */
+let vegetationLayer = null; /* optional vegetation polygon overlay */
+let terrainLayer    = null; /* optional terrain difficulty overlay */
 
 /* ── Map initialisation ──────────────────────────────────────────── */
 const map = L.map('map', { zoomControl: true }).setView([47.7728, 9.0883], 13);
@@ -71,6 +95,53 @@ if (navigator.geolocation) {
   navigator.geolocation.getCurrentPosition(
     ({ coords }) => map.setView([coords.latitude, coords.longitude], 12),
     () => { /* keep default */ }
+  );
+}
+
+/* ── GPS Locate control ──────────────────────────────────────────── */
+const LocateControl = L.Control.extend({
+  onAdd() {
+    const btn = L.DomUtil.create('button', 'locate-btn');
+    btn.type      = 'button';
+    btn.innerHTML = '📍';
+    btn.title     = 'Center map on my location';
+    btn.setAttribute('aria-label', 'Center map on my location');
+    L.DomEvent.disableClickPropagation(btn).on(btn, 'click', locateMe);
+    return btn;
+  },
+});
+new LocateControl({ position: 'bottomright' }).addTo(map);
+
+/**
+ * Request the device's current GPS position, pan the map to it, and place
+ * a pulsing marker with an accuracy circle.
+ */
+function locateMe() {
+  if (!navigator.geolocation) {
+    showStatus('⚠️ Geolocation is not supported by your browser.', 'error');
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    ({ coords }) => {
+      const { latitude: lat, longitude: lng, accuracy } = coords;
+      map.setView([lat, lng], 14);
+      if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
+      if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
+      locationCircle = L.circle([lat, lng], {
+        radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
+      }).addTo(map);
+      locationMarker = L.marker([lat, lng], {
+        icon: L.divIcon({
+          className: '', html: '<div class="location-dot"></div>',
+          iconSize: [16, 16], iconAnchor: [8, 8],
+        }),
+      }).bindPopup('📍 Your current location').addTo(map);
+    },
+    (err) => {
+      console.warn('Geolocation error:', err.message);
+      showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
+    },
+    { enableHighAccuracy: true, timeout: 10000 }
   );
 }
 
@@ -90,6 +161,9 @@ const sidebarEl       = document.getElementById('sidebar');
 const sidebarToggleBtn= document.getElementById('sidebarToggle');
 const sidebarCloseBtn = document.getElementById('sidebarClose');
 const sidebarOverlay  = document.getElementById('sidebarOverlay');
+const vegDampeningCb  = document.getElementById('vegDampening');
+const showTerrainCb   = document.getElementById('showTerrain');
+const terrainLegendEl = document.getElementById('terrainLegend');
 
 /* ── Mobile sidebar toggle ───────────────────────────────────────── */
 function openSidebar() {
@@ -190,6 +264,50 @@ function setCachedRoads(bounds, ways) {
   }
 }
 
+/* ── Vegetation cache (localStorage) ────────────────────────────── */
+const VEG_CACHE_PREFIX = '4w_veg_';
+
+function vegCacheKey(bounds) {
+  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
+  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
+  return `${VEG_CACHE_PREFIX}${s},${w},${n},${e}`;
+}
+function getCachedVegetation(bounds) {
+  try {
+    const raw = localStorage.getItem(vegCacheKey(bounds));
+    if (!raw) return null;
+    const { polys, cachedAt } = JSON.parse(raw);
+    if (Date.now() - cachedAt > ROAD_CACHE_TTL_MS) { localStorage.removeItem(vegCacheKey(bounds)); return null; }
+    return polys;
+  } catch { return null; }
+}
+function setCachedVegetation(bounds, polys) {
+  try { localStorage.setItem(vegCacheKey(bounds), JSON.stringify({ polys, cachedAt: Date.now() })); }
+  catch { /* quota exceeded */ }
+}
+
+/* ── Terrain cache (localStorage) ───────────────────────────────── */
+const TERRAIN_CACHE_PREFIX = '4w_terrain_';
+
+function terrainCacheKey(bounds) {
+  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
+  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
+  return `${TERRAIN_CACHE_PREFIX}${s},${w},${n},${e}`;
+}
+function getCachedTerrain(bounds) {
+  try {
+    const raw = localStorage.getItem(terrainCacheKey(bounds));
+    if (!raw) return null;
+    const { ways, cachedAt } = JSON.parse(raw);
+    if (Date.now() - cachedAt > ROAD_CACHE_TTL_MS) { localStorage.removeItem(terrainCacheKey(bounds)); return null; }
+    return ways;
+  } catch { return null; }
+}
+function setCachedTerrain(bounds, ways) {
+  try { localStorage.setItem(terrainCacheKey(bounds), JSON.stringify({ ways, cachedAt: Date.now() })); }
+  catch { /* quota exceeded */ }
+}
+
 /**
  * Register the current map view as an anonymous planned trip.
  * Failures are surfaced to the user but do not block other functionality.
@@ -249,6 +367,14 @@ async function fetchPlannedTrips(bounds) {
 
 planTripBtn.addEventListener('click', planTrip);
 
+/* Hide terrain layer immediately when the toggle is switched off */
+showTerrainCb.addEventListener('change', () => {
+  if (!showTerrainCb.checked) {
+    if (terrainLayer) { map.removeLayer(terrainLayer); terrainLayer = null; }
+    terrainLegendEl.classList.add('hidden');
+  }
+});
+
 /* ── Build weight sliders ────────────────────────────────────────── */
 WEIGHT_UI_GROUPS.forEach(group => {
   const row = document.createElement('div');
@@ -307,9 +433,13 @@ async function runAnalysis() {
 
   try {
     const bounds = map.getBounds();
-    const [ways, plannedTrips] = await Promise.all([
+    const useVeg     = vegDampeningCb.checked;
+    const useTerrain = showTerrainCb.checked;
+    const [ways, plannedTrips, vegetation, terrainWays] = await Promise.all([
       fetchRoads(bounds),
       fetchPlannedTrips(bounds),
+      useVeg     ? fetchVegetation(bounds) : Promise.resolve([]),
+      useTerrain ? fetchTerrain(bounds)    : Promise.resolve([]),
     ]);
 
     if (!ways.length) {
@@ -320,20 +450,31 @@ async function runAnalysis() {
     const tripNote = plannedTrips.length
       ? ` (${plannedTrips.length} trip${plannedTrips.length > 1 ? 's' : ''} planned here – silence score adjusted)`
       : '';
-    showStatus(`🧮 Calculating noise scores for ${ways.length} roads…${tripNote}`, 'info');
+    const vegNote = (useVeg && vegetation.length)
+      ? `, ${vegetation.length} vegetation area(s) dampening noise`
+      : '';
+    showStatus(`🧮 Calculating noise scores for ${ways.length} roads…${tripNote}${vegNote}`, 'info');
 
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
-    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips);
+    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips, vegetation);
 
     renderHeatmap(heatPoints);
     renderTripRects(plannedTrips);
+    renderVegetationLayer(useVeg ? vegetation : []);
+    renderTerrainLayer(useTerrain ? terrainWays : []);
+    if (useTerrain && terrainWays.length) {
+      terrainLegendEl.classList.remove('hidden');
+    } else {
+      terrainLegendEl.classList.add('hidden');
+    }
     renderResults(quietestPoints);
 
     showStatus(
       `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
-      (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : ''),
+      (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
+      (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : ''),
       'success'
     );
   } catch (err) {
@@ -414,6 +555,93 @@ async function fetchRoads(bounds) {
   return ways;
 }
 
+/**
+ * Fetch vegetation polygons (forests, scrubland, wetlands, etc.) for the
+ * given bounds via Overpass, caching the result in localStorage.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} Pre-processed polygon objects with bounding boxes
+ */
+async function fetchVegetation(bounds) {
+  const cached = getCachedVegetation(bounds);
+  if (cached) return cached;
+
+  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
+  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
+  const query =
+    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
+    `(way["natural"~"^(wood|scrub|heath|wetland|grassland)$"](${bbox});` +
+    `way["landuse"~"^(forest|meadow|grass|orchard|vineyard)$"](${bbox}););` +
+    `out geom;`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:   `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const polys = (data.elements || [])
+      .filter(el => el.geometry && el.geometry.length >= 3)
+      .map(el => ({
+        type:    el.tags.natural || el.tags.landuse || '',
+        geometry: el.geometry,
+        minLat:  Math.min(...el.geometry.map(p => p.lat)),
+        maxLat:  Math.max(...el.geometry.map(p => p.lat)),
+        minLon:  Math.min(...el.geometry.map(p => p.lon)),
+        maxLon:  Math.max(...el.geometry.map(p => p.lon)),
+      }));
+    setCachedVegetation(bounds, polys);
+    return polys;
+  } catch (err) {
+    console.warn('Vegetation fetch failed:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Fetch difficult terrain paths (sac_scale hiking routes, rough tracks)
+ * for the given bounds via Overpass, caching the result in localStorage.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} Overpass way elements
+ */
+async function fetchTerrain(bounds) {
+  const cached = getCachedTerrain(bounds);
+  if (cached) return cached;
+
+  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
+  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
+  const query =
+    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
+    `(way["highway"]["sac_scale"](${bbox});` +
+    `way["highway"="track"]["tracktype"~"^(grade4|grade5)$"](${bbox}););` +
+    `out geom;`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:   `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const ways = (data.elements || []).filter(el => el.geometry && el.geometry.length >= 2);
+    setCachedTerrain(bounds, ways);
+    return ways;
+  } catch (err) {
+    console.warn('Terrain fetch failed:', err.message);
+    return [];
+  }
+}
+
 /* ── Noise computation ───────────────────────────────────────────── */
 const GRID_SIZE = 50; /* points per axis → 50×50 = 2 500 sample points */
 const OVERPASS_TIMEOUT_S   = 25;   /* server-side timeout in seconds */
@@ -421,7 +649,7 @@ const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort wi
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
 
-function computeHeatmap(ways, bounds, plannedTrips = []) {
+function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = []) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
@@ -478,6 +706,21 @@ function computeHeatmap(ways, bounds, plannedTrips = []) {
         if (noise > noiseScore) noiseScore = noise;
       }
 
+      /* Apply vegetation dampening: points inside a vegetation polygon
+         receive a noise reduction proportional to the vegetation density.
+         The maximum dampening factor across all overlapping polygons is used. */
+      if (vegetation.length) {
+        let maxDamp = 0;
+        for (const vp of vegetation) {
+          if (lat < vp.minLat || lat > vp.maxLat || lng < vp.minLon || lng > vp.maxLon) continue;
+          if (pointInPolygon(lat, lng, vp.geometry)) {
+            const d = VEGETATION_DAMPENING[vp.type] || 0;
+            if (d > maxDamp) maxDamp = d;
+          }
+        }
+        if (maxDamp > 0) noiseScore *= (1 - maxDamp);
+      }
+
       /* Add a penalty for each planned trip whose bbox covers this point.
          This reduces the effective silence score of areas that are already
          planned by other users. */
@@ -518,6 +761,29 @@ function ptSegDist(px, py, ax, ay, bx, by) {
   const cx = ax + t * dx;
   const cy = ay + t * dy;
   return Math.hypot(px - cx, py - cy);
+}
+
+/**
+ * Ray-casting point-in-polygon test.
+ * @param {number} lat - Point latitude
+ * @param {number} lng - Point longitude
+ * @param {Array<{lat:number,lon:number}>} polygon - Polygon vertices from Overpass geometry
+ * @returns {boolean}
+ */
+function pointInPolygon(lat, lng, polygon) {
+  let inside = false;
+  const n = polygon.length;
+  let j = n - 1;
+  for (let i = 0; i < n; i++) {
+    const xi = polygon[i].lon, yi = polygon[i].lat;
+    const xj = polygon[j].lon, yj = polygon[j].lat;
+    if (((yi > lat) !== (yj > lat)) &&
+        (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+    j = i;
+  }
+  return inside;
 }
 
 /* ── Heatmap rendering ───────────────────────────────────────────── */
@@ -620,6 +886,55 @@ function renderTripRects(trips) {
      .addTo(map);
     tripRects.push(rect);
   });
+}
+
+/* ── Vegetation overlay ──────────────────────────────────────────── */
+
+/**
+ * Draw semi-transparent green polygons for vegetation areas so users can
+ * see where noise dampening is being applied.
+ * @param {Array} polys  Pre-processed polygon objects from fetchVegetation()
+ */
+function renderVegetationLayer(polys) {
+  if (vegetationLayer) { map.removeLayer(vegetationLayer); vegetationLayer = null; }
+  if (!polys.length) return;
+  vegetationLayer = L.layerGroup();
+  polys.forEach(vp => {
+    const latLngs = vp.geometry.map(p => [p.lat, p.lon]);
+    L.polygon(latLngs, {
+      color: '#4ade80', weight: 0.8,
+      fillColor: '#4ade80', fillOpacity: 0.15,
+    }).bindTooltip(`🌲 Vegetation: ${vp.type.replace(/_/g, ' ')}`)
+      .addTo(vegetationLayer);
+  });
+  vegetationLayer.addTo(map);
+}
+
+/* ── Terrain accessibility overlay ──────────────────────────────── */
+
+/**
+ * Draw polylines for rough/demanding terrain paths so users can assess
+ * accessibility.  Colour-coded by difficulty.
+ * @param {Array} ways  Overpass way elements from fetchTerrain()
+ */
+function renderTerrainLayer(ways) {
+  if (terrainLayer) { map.removeLayer(terrainLayer); terrainLayer = null; }
+  if (!ways.length) return;
+  terrainLayer = L.layerGroup();
+  ways.forEach(way => {
+    const latLngs = way.geometry.map(p => [p.lat, p.lon]);
+    const sacScale  = way.tags && way.tags.sac_scale;
+    const tracktype = way.tags && way.tags.tracktype;
+    const isDemanding = sacScale && sacScale !== 'hiking';
+    const color = isDemanding ? TERRAIN_COLORS.demanding_trail : TERRAIN_COLORS.rough_track;
+    const label = sacScale
+      ? `🥾 Difficulty: ${sacScale.replace(/_/g, ' ')}`
+      : `🚧 Rough track (${tracktype})`;
+    L.polyline(latLngs, { color, weight: 2.5, opacity: 0.85 })
+      .bindTooltip(label)
+      .addTo(terrainLayer);
+  });
+  terrainLayer.addTo(map);
 }
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
