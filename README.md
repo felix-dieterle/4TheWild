@@ -85,6 +85,33 @@ cd android && ./gradlew assembleDebug
 
 A GitHub Actions workflow (`.github/workflows/android-build.yml`) builds a debug APK on every push to `main` and on pull requests. The APK is uploaded as a workflow artifact (retained for 30 days).
 
+#### Making the APK updatable (no uninstall required)
+
+Android requires that every APK update is signed with the **same key**. Because the CI runner is ephemeral, a new debug keystore would be generated on every run — meaning each build produces a differently-signed APK that cannot update an already-installed version.
+
+To fix this, store a persistent keystore as a repository secret:
+
+1. Generate a keystore once on your local machine (standard Android debug credentials):
+   ```bash
+   keytool -genkeypair -v \
+     -keystore debug.keystore \
+     -alias androiddebugkey \
+     -keyalg RSA -keysize 2048 \
+     -validity 10000 \
+     -storepass android \
+     -keypass android \
+     -dname "CN=Android Debug,O=Android,C=US"
+   ```
+2. Base64-encode the file:
+   ```bash
+   base64 -w 0 debug.keystore   # Linux
+   base64 debug.keystore        # macOS
+   ```
+3. Add the output as a repository secret named **`KEYSTORE_BASE64`**:  
+   *GitHub → Repository → Settings → Secrets and variables → Actions → New repository secret*
+
+The workflow will automatically restore this keystore before every build, ensuring all APKs share the same signing key and can be installed as updates without uninstalling first. The `versionCode` is set to the workflow run number so Android always sees each new build as a newer version.
+
 ## Tech stack
 
 - [Leaflet.js 1.9](https://leafletjs.com/) – map rendering
