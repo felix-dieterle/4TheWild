@@ -280,3 +280,60 @@ footer a { color: var(--accent2); text-decoration: none; }
   font-size: 0.75rem; font-weight: 700; color: #111;
   box-shadow: 0 2px 8px rgba(0,0,0,0.6);
 }
+
+/* ── GPS Locate control ─────────────────────────────────────────── */
+.locate-btn {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  font-size: 1.1rem;
+  background: var(--surface, #23272f);
+  color: var(--text, #e2e8f0);
+  border: 1px solid var(--border, #2e3340);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.locate-btn:hover { filter: brightness(1.2); }
+
+/* ── Current location marker ────────────────────────────────────── */
+.location-dot {
+  width: 16px;
+  height: 16px;
+  background: #60a5fa;
+  border: 2.5px solid #fff;
+  border-radius: 50%;
+  animation: pulse-location 2s ease-out infinite;
+}
+@keyframes pulse-location {
+  0%   { box-shadow: 0 0 0 0   rgba(96, 165, 250, 0.5); }
+  70%  { box-shadow: 0 0 0 12px rgba(96, 165, 250, 0);  }
+  100% { box-shadow: 0 0 0 0   rgba(96, 165, 250, 0);   }
+}
+
+/* ── Nature & Terrain card controls ─────────────────────────────── */
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: var(--text);
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.toggle-label input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+
+.terrain-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.75rem;
+}

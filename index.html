@@ -72,6 +72,28 @@
         </div>
       </section>
 
+      <!-- Nature & Terrain -->
+      <section class="card" id="natureCard">
+        <h2>🌲 Nature &amp; Terrain</h2>
+        <p class="hint">
+          Vegetation (forests, scrubland, wetlands) dampens sound and is
+          factored into the heatmap. The terrain layer shows rough tracks and
+          demanding hiking routes that indicate low accessibility.
+        </p>
+        <label class="toggle-label">
+          <input type="checkbox" id="vegDampening" checked />
+          Vegetation noise dampening
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="showTerrain" />
+          Show terrain accessibility layer
+        </label>
+        <div class="terrain-legend hidden" id="terrainLegend">
+          <span class="legend-item" style="color:#f59e0b">── Rough track (grade 4/5)</span>
+          <span class="legend-item" style="color:#ef4444">── Demanding trail</span>
+        </div>
+      </section>
+
       <!-- Road weights -->
       <section class="card" id="weightsCard">
         <h2>Road Noise Weights</h2>
