@@ -16,6 +16,10 @@
  * Low score  → quiet / uncrowded (ideal).
  */
 
+/* ── App version & build ─────────────────────────────────────────── */
+const APP_VERSION = '1.0.0';
+const APP_BUILD   = 1;
+
 /* ── Vegetation noise-dampening factors (0 = no reduction, 1 = full) */
 const VEGETATION_DAMPENING = {
   wood:      0.60, /* dense forest  */
@@ -953,3 +957,14 @@ function showTripStatus(msg, type = 'info') {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+/* ── Startup version splash ──────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', function showVersionSplash() {
+  const splash = document.getElementById('versionSplash');
+  if (!splash) return;
+  splash.querySelector('.splash-version').textContent =
+    `v${APP_VERSION}  ·  build ${APP_BUILD}`;
+  splash.classList.remove('hidden');
+  setTimeout(() => splash.classList.add('splash-fade-out'), 1800);
+  setTimeout(() => splash.remove(), 2500);
+});
