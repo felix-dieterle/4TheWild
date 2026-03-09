@@ -259,6 +259,41 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
 }).addTo(map);
 
+/* ── Map loading overlay ─────────────────────────────────────────── */
+/* Created programmatically so it lives inside the Leaflet container  */
+/* (which already has position:relative) and stacks above all panes.  */
+const mapLoadingEl = (() => {
+  const el = document.createElement('div');
+  el.id = 'mapLoading';
+  el.className = 'hidden';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  el.innerHTML = '<div class="map-spinner"></div><span class="map-loading-text"></span>';
+  document.getElementById('map').appendChild(el);
+  return el;
+})();
+const mapLoadingText = mapLoadingEl.querySelector('.map-loading-text');
+
+/**
+ * Place (or replace) the pulsing location dot and accuracy circle on the map.
+ * @param {number} lat
+ * @param {number} lng
+ * @param {number} accuracy  Accuracy radius in metres.
+ */
+function placeLocationMarker(lat, lng, accuracy) {
+  if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
+  if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
+  locationCircle = L.circle([lat, lng], {
+    radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
+  }).addTo(map);
+  locationMarker = L.marker([lat, lng], {
+    icon: L.divIcon({
+      className: '', html: '<div class="location-dot"></div>',
+      iconSize: [16, 16], iconAnchor: [8, 8],
+    }),
+  }).bindPopup('📍 Your current location').addTo(map);
+}
+
 /* Try to center on the user's location, requesting permission if needed */
 (async () => {
   try {
@@ -266,7 +301,9 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       await window.Capacitor.Plugins.Geolocation.requestPermissions();
     }
     const { coords } = await fetchCurrentPosition({ timeout: 10000 });
-    map.setView([coords.latitude, coords.longitude], 12);
+    const { latitude: lat, longitude: lng, accuracy } = coords;
+    map.setView([lat, lng], 12);
+    placeLocationMarker(lat, lng, accuracy);
   } catch (e) { console.debug('Could not center on user location:', e); /* keep default view */ }
 })();
 
@@ -312,17 +349,7 @@ async function locateMe() {
     const { coords } = await fetchCurrentPosition({ enableHighAccuracy: true, timeout: 10000 });
     const { latitude: lat, longitude: lng, accuracy } = coords;
     map.setView([lat, lng], 14);
-    if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
-    if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
-    locationCircle = L.circle([lat, lng], {
-      radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
-    }).addTo(map);
-    locationMarker = L.marker([lat, lng], {
-      icon: L.divIcon({
-        className: '', html: '<div class="location-dot"></div>',
-        iconSize: [16, 16], iconAnchor: [8, 8],
-      }),
-    }).bindPopup('📍 Your current location').addTo(map);
+    placeLocationMarker(lat, lng, accuracy);
   } catch (err) {
     console.warn('Geolocation error:', err?.message || err);
     showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
@@ -614,6 +641,8 @@ async function runAnalysis() {
     closeSidebar();
   }
   showStatus('⏳ Fetching road data…', 'info');
+  mapLoadingText.textContent = 'Fetching road data…';
+  mapLoadingEl.classList.remove('hidden');
 
   try {
     const bounds = map.getBounds();
@@ -638,6 +667,7 @@ async function runAnalysis() {
       ? `, ${vegetation.length} vegetation area(s) dampening noise`
       : '';
     showStatus(`🧮 Calculating noise scores for ${ways.length} roads…${tripNote}${vegNote}`, 'info');
+    mapLoadingText.textContent = 'Calculating noise scores…';
 
     /* Yield to the browser before heavy computation */
     await sleep(30);
@@ -671,6 +701,7 @@ async function runAnalysis() {
   } finally {
     analyzing = false;
     analyzeBtn.disabled = false;
+    mapLoadingEl.classList.add('hidden');
   }
 }
 
