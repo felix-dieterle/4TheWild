@@ -223,21 +223,52 @@ let locationCircle  = null; /* accuracy circle around current position */
 let vegetationLayer = null; /* optional vegetation polygon overlay */
 let terrainLayer    = null; /* optional terrain difficulty overlay */
 
+/* ── Capacitor helpers ───────────────────────────────────────────── */
+
+/** Returns true when running inside a Capacitor-wrapped native app. */
+const isNative = () =>
+  typeof window.Capacitor !== 'undefined' &&
+  typeof window.Capacitor.isNativePlatform === 'function' &&
+  window.Capacitor.isNativePlatform();
+
+/**
+ * Resolve the device's current position.
+ * Uses the Capacitor Geolocation plugin in a native context so that Android
+ * shows the runtime permission dialog; falls back to navigator.geolocation in
+ * the browser.
+ * @param {PositionOptions} [opts]
+ * @returns {Promise<GeolocationPosition>}
+ */
+function fetchCurrentPosition(opts) {
+  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+    return window.Capacitor.Plugins.Geolocation.getCurrentPosition(opts);
+  }
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(resolve, reject, opts);
+  });
+}
+
 /* ── Map initialisation ──────────────────────────────────────────── */
-const map = L.map('map', { zoomControl: true }).setView([47.7728, 9.0883], 13);
+/* tap:false disables Leaflet's custom tap emulation so that the     */
+/* Capacitor WebView can rely on native touch-to-click conversion.   */
+/* Without this, marker popups are not triggered by touch on Android.*/
+const map = L.map('map', { zoomControl: true, tap: false }).setView([47.7728, 9.0883], 13);
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   maxZoom: 19,
 }).addTo(map);
 
-/* Try to center on the user's location */
-if (navigator.geolocation) {
-  navigator.geolocation.getCurrentPosition(
-    ({ coords }) => map.setView([coords.latitude, coords.longitude], 12),
-    () => { /* keep default */ }
-  );
-}
+/* Try to center on the user's location, requesting permission if needed */
+(async () => {
+  try {
+    if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+      await window.Capacitor.Plugins.Geolocation.requestPermissions();
+    }
+    const { coords } = await fetchCurrentPosition({ timeout: 10000 });
+    map.setView([coords.latitude, coords.longitude], 12);
+  } catch (e) { console.debug('Could not center on user location:', e); /* keep default view */ }
+})();
 
 /* ── GPS Locate control ──────────────────────────────────────────── */
 const LocateControl = L.Control.extend({
@@ -256,34 +287,46 @@ new LocateControl({ position: 'bottomright' }).addTo(map);
 /**
  * Request the device's current GPS position, pan the map to it, and place
  * a pulsing marker with an accuracy circle.
+ * On Android (Capacitor) this first requests the runtime location permission
+ * so the OS permission dialog is shown to the user if needed.
  */
-function locateMe() {
-  if (!navigator.geolocation) {
+async function locateMe() {
+  if (!navigator.geolocation && !isNative()) {
     showStatus('⚠️ Geolocation is not supported by your browser.', 'error');
     return;
   }
-  navigator.geolocation.getCurrentPosition(
-    ({ coords }) => {
-      const { latitude: lat, longitude: lng, accuracy } = coords;
-      map.setView([lat, lng], 14);
-      if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
-      if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
-      locationCircle = L.circle([lat, lng], {
-        radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
-      }).addTo(map);
-      locationMarker = L.marker([lat, lng], {
-        icon: L.divIcon({
-          className: '', html: '<div class="location-dot"></div>',
-          iconSize: [16, 16], iconAnchor: [8, 8],
-        }),
-      }).bindPopup('📍 Your current location').addTo(map);
-    },
-    (err) => {
-      console.warn('Geolocation error:', err.message);
-      showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
-    },
-    { enableHighAccuracy: true, timeout: 10000 }
-  );
+  try {
+    if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+      const perm = await window.Capacitor.Plugins.Geolocation.requestPermissions();
+      if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
+        showStatus('⚠️ Location access denied. Please enable in Settings.', 'error');
+        return;
+      }
+    } else if (isNative()) {
+      /* Native context but plugin not available – fall through to navigator.geolocation */
+      if (!navigator.geolocation) {
+        showStatus('⚠️ Geolocation is not supported on this device.', 'error');
+        return;
+      }
+    }
+    const { coords } = await fetchCurrentPosition({ enableHighAccuracy: true, timeout: 10000 });
+    const { latitude: lat, longitude: lng, accuracy } = coords;
+    map.setView([lat, lng], 14);
+    if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
+    if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
+    locationCircle = L.circle([lat, lng], {
+      radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
+    }).addTo(map);
+    locationMarker = L.marker([lat, lng], {
+      icon: L.divIcon({
+        className: '', html: '<div class="location-dot"></div>',
+        iconSize: [16, 16], iconAnchor: [8, 8],
+      }),
+    }).bindPopup('📍 Your current location').addTo(map);
+  } catch (err) {
+    console.warn('Geolocation error:', err?.message || err);
+    showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
+  }
 }
 
 /* ── DOM refs ────────────────────────────────────────────────────── */

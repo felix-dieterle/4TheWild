@@ -288,6 +288,7 @@ footer a { color: var(--accent2); text-decoration: none; }
   border-radius: 50%; width: 28px; height: 28px;
   font-size: 0.75rem; font-weight: 700; color: #111;
   box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+  touch-action: manipulation;
 }
 
 /* ── GPS Locate control ─────────────────────────────────────────── */
@@ -315,6 +316,7 @@ footer a { color: var(--accent2); text-decoration: none; }
   background: #60a5fa;
   border: 2.5px solid #fff;
   border-radius: 50%;
+  touch-action: manipulation;
   animation: pulse-location 2s ease-out infinite;
 }
 @keyframes pulse-location {
