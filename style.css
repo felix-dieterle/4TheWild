@@ -14,12 +14,19 @@
 }
 
 html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; }
-body { background: var(--bg); color: var(--text); }
+body {
+  background: var(--bg);
+  color: var(--text);
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
 
 /* ── Layout ────────────────────────────────────────────────────── */
 #app {
   display: flex;
-  height: 100vh;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -205,8 +212,8 @@ footer a { color: var(--accent2); text-decoration: none; }
 #sidebarToggle {
   display: none;
   position: fixed;
-  top: 12px;
-  left: 12px;
+  top: calc(12px + env(safe-area-inset-top));
+  left: calc(12px + env(safe-area-inset-left));
   z-index: 2000;
   width: 40px;
   height: 40px;
@@ -254,6 +261,8 @@ footer a { color: var(--accent2); text-decoration: none; }
     border-bottom: none;
     transition: transform 0.25s ease;
     transform: translateX(0);
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
   }
   #sidebar.hidden-mobile {
     transform: translateX(-100%);
@@ -268,7 +277,7 @@ footer a { color: var(--accent2); text-decoration: none; }
   }
   #sidebarOverlay.hidden { display: none !important; }
 
-  #map { flex: 1; height: 100vh; }
+  #map { flex: 1; height: 100%; }
 }
 
 /* ── Leaflet overrides ──────────────────────────────────────────── */
@@ -341,7 +350,7 @@ footer a { color: var(--accent2); text-decoration: none; }
 /* ── Version splash ──────────────────────────────────────────────── */
 #versionSplash {
   position: fixed;
-  bottom: 24px;
+  bottom: calc(24px + env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
