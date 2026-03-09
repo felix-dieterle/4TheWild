@@ -2,11 +2,20 @@
  * 4TheWild – Silent Place Finder
  *
  * Fetches road data from the OpenStreetMap Overpass API and computes a
- * noise-weighted heatmap. Each road type gets a weight reflecting its
- * typical traffic noise. The grid-based score for a point is:
+ * noise-weighted heatmap. Each road type gets a base weight reflecting its
+ * typical traffic noise, further refined by a dynamic per-way factor that
+ * accounts for the road's tagged speed limit (maxspeed) and lane count.
+ * The grid-based score for a point is:
  *
- *   noiseScore(p) = max over all segments s { weight(s) * 1000 / dist(p, s) }
- *                  + tripCount(p) * TRIP_NOISE_PENALTY
+ *   effectiveWeight(s) = baseWeight(highway) × dynamicNoiseFactor(maxspeed, lanes)
+ *   noiseScore(p)      = max over all segments s { effectiveWeight(s) * 1000 / dist(p, s) }
+ *                        + tripCount(p) × TRIP_NOISE_PENALTY
+ *
+ * dynamicNoiseFactor scales noise up when a road has a higher-than-typical
+ * speed limit or more lanes than the default for its type, and down when it
+ * has a lower speed limit or fewer lanes. Country-coded maxspeed tags such as
+ * "DE:motorway" or "GB:rural" are resolved via COUNTRY_MAXSPEEDS, so the
+ * algorithm automatically adapts to country-specific speed regulations.
  *
  * tripCount(p) is the number of active anonymous trip plans whose bounding
  * box contains p. Each planned trip reduces the silence score of the area,
@@ -40,7 +49,12 @@ const TERRAIN_COLORS = {
   demanding_trail: '#ef4444', /* mountain/alpine hiking */
 };
 
-/* ── Road type noise weights (higher = louder) ──────────────────── */
+/* ── Road type noise weights (higher = louder) ──────────────────────
+ * These are the BASE weights for each highway type, reflecting typical
+ * traffic volume and road importance.  They are multiplied at runtime
+ * by dynamicNoiseFactor() which adjusts for the actual tagged speed
+ * limit and lane count of each individual way.
+ * ──────────────────────────────────────────────────────────────────── */
 const DEFAULT_ROAD_WEIGHTS = {
   motorway:         10,
   motorway_link:     7,
@@ -53,15 +67,138 @@ const DEFAULT_ROAD_WEIGHTS = {
   tertiary:          2,
   tertiary_link:     1.5,
   residential:       1.5,
-  living_street:     1,
+  living_street:     0.5,  /* pedestrian-priority shared space, ≤10 km/h */
   unclassified:      1,
-  service:           0.8,
+  service:           0.5,  /* low-traffic access/parking roads */
   track:             0.4,
   path:              0.2,
   cycleway:          0.2,
   footway:           0.15,
   pedestrian:        0.25,
   steps:             0.1,
+};
+
+/* ── Country-coded maxspeed defaults (km/h) ─────────────────────────
+ * OSM ways may carry a maxspeed tag like "DE:rural" or "GB:motorway"
+ * instead of a bare numeric value. The table below maps these codes to
+ * their legally defined speed limit in km/h.
+ * ──────────────────────────────────────────────────────────────────── */
+const COUNTRY_MAXSPEEDS = {
+  /* Germany */
+  'DE:urban':      50,
+  'DE:rural':     100,
+  'DE:motorway':  130,  /* Richtgeschwindigkeit – advisory, no hard limit */
+  /* Austria */
+  'AT:urban':      50,
+  'AT:rural':     100,
+  'AT:motorway':  130,
+  /* Switzerland */
+  'CH:urban':      50,
+  'CH:rural':      80,
+  'CH:motorway':  120,
+  /* France */
+  'FR:urban':      50,
+  'FR:rural':      80,
+  'FR:motorway':  130,
+  /* Italy */
+  'IT:urban':      50,
+  'IT:rural':      90,
+  'IT:motorway':  130,
+  /* Netherlands */
+  'NL:urban':      50,
+  'NL:rural':      80,
+  'NL:motorway':  130,
+  /* Belgium */
+  'BE:urban':      50,
+  'BE:rural':      70,
+  'BE:motorway':  120,
+  /* Luxembourg */
+  'LU:urban':      50,
+  'LU:rural':      90,
+  'LU:motorway':  130,
+  /* Spain */
+  'ES:urban':      50,
+  'ES:rural':      90,
+  'ES:motorway':  120,
+  /* Portugal */
+  'PT:urban':      50,
+  'PT:rural':      90,
+  'PT:motorway':  120,
+  /* Czech Republic */
+  'CZ:urban':      50,
+  'CZ:rural':      90,
+  'CZ:motorway':  130,
+  /* Poland */
+  'PL:urban':      50,
+  'PL:rural':      90,
+  'PL:motorway':  140,
+  /* United Kingdom (mph converted to km/h) */
+  'GB:urban':      48,  /* 30 mph */
+  'GB:rural':      96,  /* 60 mph */
+  'GB:nsl_dual':  112,  /* 70 mph national speed limit, dual carriageway */
+  'GB:motorway':  112,  /* 70 mph */
+  /* Russia */
+  'RU:urban':      60,
+  'RU:rural':      90,
+  'RU:motorway':  110,
+  /* United States (mph converted to km/h, representative values) */
+  'US:urban':      40,
+  'US:rural':      88,  /* 55 mph */
+  'US:motorway':  105,  /* 65 mph – varies by state */
+};
+
+/* ── Default speed limits (km/h) by road type ───────────────────────
+ * Used when a way has no maxspeed tag and no applicable country code.
+ * Values represent a conservative estimate for a mixed-country context.
+ * ──────────────────────────────────────────────────────────────────── */
+const DEFAULT_SPEEDS = {
+  motorway:       110,  /* conservative: actual range is 80–unlimited */
+  motorway_link:   80,
+  trunk:           90,
+  trunk_link:      70,
+  primary:         70,
+  primary_link:    50,
+  secondary:       60,
+  secondary_link:  50,
+  tertiary:        50,
+  tertiary_link:   40,
+  residential:     30,
+  living_street:   10,
+  unclassified:    50,
+  service:         20,
+  track:           15,
+  path:             8,
+  cycleway:        20,
+  footway:          5,
+  pedestrian:       5,
+  steps:            3,
+};
+
+/* ── Default lane counts by road type ───────────────────────────────
+ * Used when a way has no lanes tag.  Motorways count total lanes
+ * (both directions combined) since OSM lanes tag does the same.
+ * ──────────────────────────────────────────────────────────────────── */
+const DEFAULT_LANES = {
+  motorway:       4,    /* 2 × 2 – typical dual carriageway */
+  motorway_link:  2,
+  trunk:          2,
+  trunk_link:     2,
+  primary:        2,
+  primary_link:   1,
+  secondary:      2,
+  secondary_link: 1,
+  tertiary:       2,
+  tertiary_link:  1,
+  residential:    2,
+  living_street:  1,
+  unclassified:   2,
+  service:        1,
+  track:          1,
+  path:           1,
+  cycleway:       1,
+  footway:        1,
+  pedestrian:     1,
+  steps:          1,
 };
 
 /* Road type groups shown in the sidebar (label → list of highway values) */
@@ -653,6 +790,109 @@ const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort wi
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
 
+/* Speed plausibility bounds for dynamicNoiseFactor().
+ * Speeds below MIN_PLAUSIBLE_SPEED_KMH (e.g. a mapped "5" on a cycle path)
+ * or above MAX_PLAUSIBLE_SPEED_KMH are clamped to prevent extreme factors
+ * from distorting the heatmap due to data-entry errors or special cases. */
+const MIN_PLAUSIBLE_SPEED_KMH = 5;   /* slowest meaningful motorised movement */
+const MAX_PLAUSIBLE_SPEED_KMH = 200; /* no production vehicle legally exceeds this */
+
+/* Bounds on the combined speed × lanes noise multiplier.
+ * MIN_DYNAMIC_NOISE_FACTOR ensures even a very slow single-lane road
+ * still contributes a small amount of noise.
+ * MAX_DYNAMIC_NOISE_FACTOR prevents a single tagged outlier (e.g. a
+ * 10-lane motorway) from completely dominating the heatmap. */
+const MIN_DYNAMIC_NOISE_FACTOR = 0.25;
+const MAX_DYNAMIC_NOISE_FACTOR = 4.0;
+
+/**
+ * Parse an OSM maxspeed tag value and return the speed in km/h.
+ *
+ * Handled formats:
+ *   • Bare integer/decimal:        "50", "100", "13.5"
+ *   • Value with mph unit:         "30 mph", "70mph"
+ *   • Country-coded default:       "DE:rural", "GB:motorway", "AT:urban"  ← resolved via COUNTRY_MAXSPEEDS
+ *   • Special words:               "none" / "unlimited" → 150 km/h
+ *                                    (realistic 85th-percentile speed on limit-free roads such as
+ *                                     German autobahns; higher than Germany's advisory 130 km/h)
+ *                                   "walk"              →   5 km/h
+ *                                   "signals"           →   0 (ignored; caller keeps road-type default)
+ *
+ * Returns 0 when the tag cannot be interpreted so callers fall back to DEFAULT_SPEEDS.
+ *
+ * @param {string|undefined} tag - Raw OSM maxspeed tag value
+ * @returns {number} Speed in km/h, or 0 if unknown
+ */
+function parseMaxspeed(tag) {
+  if (!tag) return 0;
+  const s = String(tag).trim();
+  const lower = s.toLowerCase();
+
+  if (lower === 'none' || lower === 'unlimited') return 150; /* realistic speed on limit-free roads */
+  if (lower === 'walk')    return 5;
+  if (lower === 'signals') return 0;
+
+  /* Country-coded value (e.g. "DE:rural", "GB:motorway") – try both case variants */
+  if (COUNTRY_MAXSPEEDS[s]     !== undefined) return COUNTRY_MAXSPEEDS[s];
+  if (COUNTRY_MAXSPEEDS[lower] !== undefined) return COUNTRY_MAXSPEEDS[lower];
+
+  /* "30 mph" or "30mph" */
+  const mphMatch = lower.match(/^(\d+(?:\.\d+)?)\s*mph$/);
+  if (mphMatch) return Math.round(parseFloat(mphMatch[1]) * 1.60934);
+
+  /* Bare numeric value (km/h) */
+  const numMatch = s.match(/^(\d+(?:\.\d+)?)/);
+  if (numMatch) return Math.round(parseFloat(numMatch[1]));
+
+  return 0;
+}
+
+/**
+ * Compute a dynamic noise-level multiplier for a road way based on its
+ * OSM tags (maxspeed and lanes), relative to the road-type defaults.
+ *
+ * Speed model
+ * ───────────
+ * Traffic noise increases roughly as speed^0.5 for aggregate mixed traffic
+ * (each doubling of speed adds ~3 dB(A)).  The factor is computed relative
+ * to DEFAULT_SPEEDS[highway] so that an untagged road of this type produces
+ * exactly 1.0.  Example: a primary road tagged maxspeed=120 (vs default 70)
+ * yields √(120/70) ≈ 1.31 → 31 % louder than an untagged primary.
+ *
+ * Lanes model
+ * ───────────
+ * Each additional lane carries proportional traffic volume; noise grows as
+ * √(lanes).  Factor is relative to DEFAULT_LANES[highway].  Example: a
+ * motorway with 6 lanes (vs default 4) yields √(6/4) ≈ 1.22.
+ *
+ * The combined factor is clamped to [MIN_DYNAMIC_NOISE_FACTOR, MAX_DYNAMIC_NOISE_FACTOR]
+ * to prevent extreme outliers (e.g. an implausibly tagged maxspeed=999 or a
+ * data-entry error in the lanes tag) from distorting the heatmap.
+ *
+ * @param {string}      highway - OSM highway value
+ * @param {object|null} tags    - Full OSM tag set for the way
+ * @returns {number} Multiplicative noise factor (1.0 = no adjustment)
+ */
+function dynamicNoiseFactor(highway, tags) {
+  let speedFactor = 1.0;
+  let lanesFactor = 1.0;
+
+  const defaultSpeed = DEFAULT_SPEEDS[highway] || 50;
+  const speed = parseMaxspeed(tags && tags.maxspeed);
+  if (speed > 0) {
+    const clampedSpeed = Math.min(MAX_PLAUSIBLE_SPEED_KMH, Math.max(MIN_PLAUSIBLE_SPEED_KMH, speed));
+    speedFactor = Math.sqrt(clampedSpeed / defaultSpeed);
+  }
+
+  const defaultLanes = DEFAULT_LANES[highway] || 2;
+  const lanes = tags && tags.lanes ? parseInt(tags.lanes, 10) : 0;
+  if (lanes >= 1) {
+    lanesFactor = Math.sqrt(lanes / defaultLanes);
+  }
+
+  return Math.min(MAX_DYNAMIC_NOISE_FACTOR, Math.max(MIN_DYNAMIC_NOISE_FACTOR, speedFactor * lanesFactor));
+}
+
 function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = []) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
@@ -669,11 +909,15 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = []) {
   /* Build array of road segments in metre-space */
   const segments = [];
   for (const way of ways) {
-    const highway = way.tags && way.tags.highway;
-    const weight  = roadWeights[highway] !== undefined
-                      ? roadWeights[highway]
-                      : DEFAULT_ROAD_WEIGHTS[highway] ?? 0;
-    if (weight <= 0) continue;
+    const highway   = way.tags && way.tags.highway;
+    const baseWeight = roadWeights[highway] !== undefined
+                        ? roadWeights[highway]
+                        : DEFAULT_ROAD_WEIGHTS[highway] ?? 0;
+    if (baseWeight <= 0) continue;
+    /* Apply per-way dynamic factor: adjusts for actual maxspeed tag and
+       lane count so that, e.g., a 6-lane autobahn at 130 km/h scores
+       higher than an untagged 2-lane motorway at the default 110 km/h. */
+    const weight = baseWeight * dynamicNoiseFactor(highway, way.tags);
     const geom = way.geometry;
     if (!geom || geom.length < 2) continue;
     for (let i = 0; i < geom.length - 1; i++) {
