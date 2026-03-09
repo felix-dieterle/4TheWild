@@ -70,11 +70,19 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
+      - name: Rename APK
+        run: |
+          APP_VERSION=$(awk -F"'" '/const APP_VERSION =/ {print $2}' www/app.js)
+          APK_NAME="4TheWild-v${APP_VERSION}-${{ github.run_number }}.apk"
+          mv android/app/build/outputs/apk/debug/app-debug.apk "android/app/build/outputs/apk/debug/${APK_NAME}"
+          echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
+          echo "APK_NAME=${APK_NAME}" >> $GITHUB_ENV
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 4TheWild-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: 4TheWild-v${{ env.APP_VERSION }}-${{ github.run_number }}
+          path: android/app/build/outputs/apk/debug/${{ env.APK_NAME }}
           retention-days: 30
 
       - name: Create GitHub Release
@@ -84,6 +92,6 @@ jobs:
         run: |
           TAG="build-${{ github.run_number }}"
           gh release create "$TAG" \
-            android/app/build/outputs/apk/debug/app-debug.apk \
+            "android/app/build/outputs/apk/debug/${{ env.APK_NAME }}" \
             --title "Build ${{ github.run_number }}" \
             --generate-notes
