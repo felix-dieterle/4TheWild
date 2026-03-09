@@ -57,7 +57,9 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
       - name: Set version code
-        run: sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
+        run: |
+          sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i "s/const APP_BUILD *= *[0-9]\+/const APP_BUILD   = ${{ github.run_number }}/" www/app.js
 
       - name: Sync web assets to Android
         run: npx cap sync android
