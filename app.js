@@ -294,17 +294,80 @@ function placeLocationMarker(lat, lng, accuracy) {
   }).bindPopup('📍 Your current location').addTo(map);
 }
 
+/**
+ * Check the current geolocation permission state and update the Location
+ * card in the sidebar.  Supports both the Capacitor Geolocation plugin
+ * (native app) and the browser Permissions API (web context).
+ */
+async function updateLocationStatus() {
+  const permStatusEl = document.getElementById('locationPermStatus');
+  const enableBtn    = document.getElementById('enableLocationBtn');
+  if (!permStatusEl || !enableBtn) return;
+
+  let state = 'unavailable'; /* 'granted' | 'denied' | 'prompt' | 'unavailable' */
+
+  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+    try {
+      const perm = await window.Capacitor.Plugins.Geolocation.checkPermissions();
+      if (perm.location === 'granted' || perm.coarseLocation === 'granted') {
+        state = 'granted';
+      } else if (perm.location === 'denied' || perm.coarseLocation === 'denied') {
+        state = 'denied';
+      } else {
+        state = 'prompt';
+      }
+    } catch { state = 'unavailable'; }
+  } else if (navigator.permissions) {
+    try {
+      const perm = await navigator.permissions.query({ name: 'geolocation' });
+      state = perm.state; /* 'granted' | 'denied' | 'prompt' */
+    } catch { state = navigator.geolocation ? 'prompt' : 'unavailable'; }
+  } else {
+    state = navigator.geolocation ? 'prompt' : 'unavailable';
+  }
+
+  permStatusEl.classList.remove('hidden');
+  switch (state) {
+    case 'granted':
+      permStatusEl.textContent = '✅ Location enabled';
+      permStatusEl.className   = 'status success';
+      enableBtn.classList.add('hidden');
+      break;
+    case 'denied':
+      permStatusEl.textContent = '❌ Location access denied – please enable in device Settings.';
+      permStatusEl.className   = 'status error';
+      enableBtn.classList.add('hidden');
+      break;
+    case 'prompt':
+      permStatusEl.textContent = '⚠️ Location not yet enabled.';
+      permStatusEl.className   = 'status';
+      enableBtn.classList.remove('hidden');
+      break;
+    default:
+      permStatusEl.textContent = '❌ Location not available on this device.';
+      permStatusEl.className   = 'status error';
+      enableBtn.classList.add('hidden');
+      break;
+  }
+}
+
 /* Try to center on the user's location, requesting permission if needed */
 (async () => {
-  try {
-    if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+  /* In a native Capacitor context, request location permission first.     */
+  /* Use a separate try-catch so a failed requestPermissions() call never  */
+  /* prevents the position fetch below from running.                       */
+  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+    try {
       await window.Capacitor.Plugins.Geolocation.requestPermissions();
-    }
+    } catch (e) { console.debug('requestPermissions failed on startup:', e); }
+  }
+  try {
     const { coords } = await fetchCurrentPosition({ timeout: 10000 });
     const { latitude: lat, longitude: lng, accuracy } = coords;
     map.setView([lat, lng], 12);
     placeLocationMarker(lat, lng, accuracy);
   } catch (e) { console.debug('Could not center on user location:', e); /* keep default view */ }
+  updateLocationStatus();
 })();
 
 /* ── GPS Locate control ──────────────────────────────────────────── */
@@ -330,6 +393,7 @@ new LocateControl({ position: 'bottomright' }).addTo(map);
 async function locateMe() {
   if (!navigator.geolocation && !isNative()) {
     showStatus('⚠️ Geolocation is not supported by your browser.', 'error');
+    updateLocationStatus();
     return;
   }
   try {
@@ -337,12 +401,14 @@ async function locateMe() {
       const perm = await window.Capacitor.Plugins.Geolocation.requestPermissions();
       if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
         showStatus('⚠️ Location access denied. Please enable in Settings.', 'error');
+        updateLocationStatus();
         return;
       }
     } else if (isNative()) {
       /* Native context but plugin not available – fall through to navigator.geolocation */
       if (!navigator.geolocation) {
         showStatus('⚠️ Geolocation is not supported on this device.', 'error');
+        updateLocationStatus();
         return;
       }
     }
@@ -354,6 +420,7 @@ async function locateMe() {
     console.warn('Geolocation error:', err?.message || err);
     showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
   }
+  updateLocationStatus();
 }
 
 /* ── DOM refs ────────────────────────────────────────────────────── */
@@ -375,6 +442,8 @@ const sidebarOverlay  = document.getElementById('sidebarOverlay');
 const vegDampeningCb  = document.getElementById('vegDampening');
 const showTerrainCb   = document.getElementById('showTerrain');
 const terrainLegendEl = document.getElementById('terrainLegend');
+
+document.getElementById('enableLocationBtn')?.addEventListener('click', locateMe);
 
 /* ── Mobile sidebar toggle ───────────────────────────────────────── */
 function openSidebar() {
