@@ -334,13 +334,27 @@ async function updateLocationStatus() {
       enableBtn.classList.add('hidden');
       break;
     case 'denied':
-      permStatusEl.textContent = '❌ Location access denied – please enable in device Settings.';
-      permStatusEl.className   = 'status error';
-      enableBtn.classList.add('hidden');
+      if (isNative()) {
+        /* On Android the "denied" state from checkPermissions() may appear
+         * before any permission dialog has ever been shown (some OEM builds),
+         * or after the first denial without "Don't ask again".  Always offer
+         * the retry button so requestPermissions() can be attempted again;
+         * locateMe() will direct the user to Settings if the system can no
+         * longer display the dialog.                                          */
+        permStatusEl.textContent = '❌ Location access denied. Tap the button to retry or enable in device Settings.';
+        permStatusEl.className   = 'status error';
+        enableBtn.textContent    = '⚙️ Enable Location / Open Settings';
+        enableBtn.classList.remove('hidden');
+      } else {
+        permStatusEl.textContent = '❌ Location access denied – please enable in device Settings.';
+        permStatusEl.className   = 'status error';
+        enableBtn.classList.add('hidden');
+      }
       break;
     case 'prompt':
       permStatusEl.textContent = '⚠️ Location not yet enabled.';
       permStatusEl.className   = 'status';
+      enableBtn.textContent    = '📍 Enable Location Access';
       enableBtn.classList.remove('hidden');
       break;
     default:
@@ -400,7 +414,10 @@ async function locateMe() {
     if (isNative() && window.Capacitor.Plugins?.Geolocation) {
       const perm = await window.Capacitor.Plugins.Geolocation.requestPermissions();
       if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
-        showStatus('⚠️ Location access denied. Please enable in Settings.', 'error');
+        /* The system could not show the permission dialog (permanently denied).
+         * Direct the user to the device Settings so they can grant the
+         * permission manually.                                                */
+        showStatus('⚠️ Location permanently denied. Please enable it via Settings → Apps → 4TheWild → Permissions → Location.', 'error');
         updateLocationStatus();
         return;
       }
