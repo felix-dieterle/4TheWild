@@ -481,3 +481,82 @@ button.secondary:hover { color: var(--danger); border-color: var(--danger); filt
 #versionSplash .splash-logo { font-size: 1.1rem; }
 #versionSplash .splash-name { font-weight: 700; color: var(--accent); }
 #versionSplash .splash-version { color: var(--muted); font-size: 0.78rem; }
+
+/* ── Error log card ──────────────────────────────────────────────── */
+#errorLogCard h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--danger);
+}
+
+.error-log-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.error-log-toggle {
+  width: auto;
+  padding: 2px 6px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 400;
+  margin-left: auto;
+}
+.error-log-toggle:hover { filter: none; color: var(--text); border-color: var(--muted); }
+
+.error-log-list {
+  list-style: none;
+  margin: 8px 0 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.error-log-entry {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 5px;
+  align-items: baseline;
+  padding: 5px 7px;
+  border-radius: 5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.error-log-time {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.error-log-source {
+  background: var(--danger);
+  color: #fff;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.error-log-msg {
+  color: var(--text);
+  word-break: break-word;
+}
