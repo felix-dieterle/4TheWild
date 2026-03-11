@@ -10,6 +10,7 @@
                  img-src 'self' data: blob: https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de;
                  connect-src 'self' https://overpass-api.de https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de http://localhost:3000 https://nominatim.openstreetmap.org https://router.project-osrm.org;" />
   <title>4TheWild – Silent Place Finder</title>
+  <link rel="icon" type="image/svg+xml" href="logo.svg" />
   <link rel="stylesheet" href="lib/leaflet.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -21,7 +22,7 @@
     <!-- ── Sidebar ───────────────────────────────────────────────── -->
     <aside id="sidebar">
       <header id="branding">
-        <span class="logo">🌿</span>
+        <img src="logo.svg" class="logo" alt="4TheWild jungle logo" />
         <div>
           <h1>4TheWild</h1>
           <p>Silent Place Finder</p>
@@ -178,7 +179,7 @@
   <script src="lib/leaflet-heat.js"></script>
   <!-- Version splash shown briefly on startup -->
   <div id="versionSplash" class="hidden" role="status" aria-live="polite">
-    <span class="splash-logo">🌿</span>
+    <img src="logo.svg" class="splash-logo" alt="4TheWild jungle logo" />
     <span class="splash-name">4TheWild</span>
     <span class="splash-version"></span>
   </div>

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="4TheWild jungle logo">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d2010"/>
+      <stop offset="100%" stop-color="#071409"/>
+    </linearGradient>
+    <radialGradient id="glowGrad" cx="50%" cy="40%" r="55%">
+      <stop offset="0%" stop-color="#1a4020" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#071409" stop-opacity="1"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="50" cy="50" r="50" fill="url(#bgGrad)"/>
+  <!-- Subtle radial glow -->
+  <circle cx="50" cy="50" r="50" fill="url(#glowGrad)" opacity="0.7"/>
+  <!-- Border ring -->
+  <circle cx="50" cy="50" r="47.5" fill="none" stroke="#4ade80" stroke-width="1.5" opacity="0.8"/>
+
+  <!-- Moon -->
+  <circle cx="78" cy="22" r="7" fill="#fbbf24" opacity="0.35"/>
+
+  <!-- Background jungle silhouette (far) -->
+  <path d="M2 78 L2 62 L8 50 L14 62 L14 52 L21 38 L28 52 L28 62 L34 50 L38 62 L38 78 Z"
+        fill="#112811" opacity="0.9"/>
+  <path d="M62 78 L62 62 L66 50 L72 62 L72 52 L79 38 L86 52 L86 62 L92 50 L98 62 L98 78 Z"
+        fill="#112811" opacity="0.9"/>
+
+  <!-- Ground -->
+  <ellipse cx="50" cy="86" rx="46" ry="10" fill="#0d2010"/>
+  <path d="M4 82 Q28 74 50 78 Q72 74 96 82" fill="none" stroke="#1a4020" stroke-width="1.5"/>
+
+  <!-- Left side trees -->
+  <rect x="14" y="55" width="5" height="30" rx="2" fill="#5c3d1e"/>
+  <!-- Left tree canopy layers -->
+  <path d="M16 58 C8 48 6 38 12 30 C13 43 17 50 16 58 Z" fill="#1a6b2a"/>
+  <path d="M17 50 C7 43 6 32 14 26 C14 40 18 46 17 50 Z" fill="#22863a"/>
+  <path d="M17 43 C11 32 13 21 20 18 C18 32 18 38 17 43 Z" fill="#2ea043"/>
+
+  <!-- Right side trees -->
+  <rect x="81" y="55" width="5" height="30" rx="2" fill="#5c3d1e"/>
+  <!-- Right tree canopy layers -->
+  <path d="M84 58 C92 48 94 38 88 30 C87 43 83 50 84 58 Z" fill="#1a6b2a"/>
+  <path d="M83 50 C93 43 94 32 86 26 C86 40 82 46 83 50 Z" fill="#22863a"/>
+  <path d="M83 43 C89 32 87 21 80 18 C82 32 82 38 83 43 Z" fill="#2ea043"/>
+
+  <!-- Central palm trunk -->
+  <path d="M50 85 Q48 70 49 58 Q50 50 50 42"
+        stroke="#7a5c2e" stroke-width="5" fill="none" stroke-linecap="round"/>
+
+  <!-- Palm fronds (from node at top of trunk ~y=42) -->
+  <!-- Far left drooping -->
+  <path d="M50 44 Q36 40 24 46" stroke="#22863a" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+  <!-- Left-diagonal -->
+  <path d="M50 44 Q40 34 30 30" stroke="#4ade80" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Left-up -->
+  <path d="M50 44 Q44 30 40 20" stroke="#4ade80" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Center-up -->
+  <path d="M50 44 Q50 28 50 14" stroke="#4ade80" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Right-up -->
+  <path d="M50 44 Q56 30 60 20" stroke="#4ade80" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Right-diagonal -->
+  <path d="M50 44 Q60 34 70 30" stroke="#4ade80" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Far right drooping -->
+  <path d="M50 44 Q64 40 76 46" stroke="#22863a" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+
+  <!-- Leaf tips at frond ends -->
+  <ellipse cx="25" cy="46" rx="6" ry="2" fill="#22863a" transform="rotate(5 25 46)"/>
+  <ellipse cx="31" cy="31" rx="6.5" ry="2.5" fill="#4ade80" transform="rotate(20 31 31)"/>
+  <ellipse cx="41" cy="21" rx="6.5" ry="2.5" fill="#4ade80" transform="rotate(55 41 21)"/>
+  <ellipse cx="50" cy="14" rx="4"   ry="6.5" fill="#4ade80"/>
+  <ellipse cx="59" cy="21" rx="6.5" ry="2.5" fill="#4ade80" transform="rotate(-55 59 21)"/>
+  <ellipse cx="69" cy="31" rx="6.5" ry="2.5" fill="#4ade80" transform="rotate(-20 69 31)"/>
+  <ellipse cx="75" cy="46" rx="6"   ry="2"   fill="#22863a" transform="rotate(-5 75 46)"/>
+
+  <!-- Hanging vines from fronds -->
+  <path d="M32 32 Q30 42 31 50" stroke="#22863a" stroke-width="1.5" fill="none" opacity="0.7" stroke-linecap="round"/>
+  <path d="M68 32 Q70 42 69 50" stroke="#22863a" stroke-width="1.5" fill="none" opacity="0.7" stroke-linecap="round"/>
+
+  <!-- Small accent leaves on vines -->
+  <ellipse cx="31" cy="44" rx="4" ry="1.5" fill="#2ea043" transform="rotate(15 31 44)" opacity="0.9"/>
+  <ellipse cx="69" cy="44" rx="4" ry="1.5" fill="#2ea043" transform="rotate(-15 69 44)" opacity="0.9"/>
+
+  <!-- Firefly/sparkle particles -->
+  <circle cx="20" cy="52" r="1.5" fill="#60a5fa" opacity="0.75"/>
+  <circle cx="80" cy="52" r="1.5" fill="#60a5fa" opacity="0.75"/>
+  <circle cx="36" cy="30" r="1"   fill="#4ade80" opacity="0.55"/>
+  <circle cx="64" cy="30" r="1"   fill="#4ade80" opacity="0.55"/>
+  <circle cx="50" cy="68" r="1"   fill="#60a5fa" opacity="0.45"/>
+</svg>
