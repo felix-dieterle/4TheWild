@@ -121,6 +121,102 @@ all APKs share the same signing key and can be installed as updates without
 uninstalling first. The `versionCode` is set to the workflow run number so Android
 always sees each new build as a newer version.
 
+## PHP/MySQL backend (apps/wild)
+
+A self-contained PHP backend lives under `apps/wild/` and provides **persistent
+caching** of Overpass road responses and trip plans in MySQL/MariaDB.  It
+mirrors the same API as the Node.js `server.js` and can replace it in
+shared-hosting environments where Node.js is unavailable.
+
+### Files
+
+| Path | Purpose |
+|------|---------|
+| `apps/wild/api.php` | Main router – handles all `/api/*` requests |
+| `apps/wild/config.php` | PDO connection factory (reads DB credentials from env vars) |
+| `apps/wild/.htaccess` | Apache mod_rewrite rules to route `/api/*` → `api.php` |
+| `apps/wild/db/schema.sql` | MySQL schema (`road_cache` + `trips` tables) |
+
+### Database schema
+
+```
+road_cache   cache_key PK, ways_json LONGTEXT, cached_at BIGINT
+trips        id CHAR(36) PK, south/west/north/east DOUBLE, created_at BIGINT
+```
+
+### Setup
+
+**1. Create the database and apply the schema**
+
+```bash
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS \`4thewild\` CHARACTER SET utf8mb4;"
+mysql -u root -p 4thewild < apps/wild/db/schema.sql
+```
+
+**2. Set environment variables** (never commit credentials)
+
+```bash
+export DB_HOST=localhost
+export DB_PORT=3306
+export DB_NAME=4thewild
+export DB_USER=your_db_user
+export DB_PASS=your_db_password
+```
+
+Apache example (`/etc/apache2/sites-available/4thewild.conf`):
+
+```apache
+<VirtualHost *:80>
+    DocumentRoot /var/www/4thewild/apps/wild
+    ServerName example.com
+
+    SetEnv DB_HOST localhost
+    SetEnv DB_PORT 3306
+    SetEnv DB_NAME 4thewild
+    SetEnv DB_USER your_db_user
+    SetEnv DB_PASS your_db_password
+
+    <Directory /var/www/4thewild/apps/wild>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+```
+
+**3. Enable mod_rewrite** (Apache)
+
+```bash
+sudo a2enmod rewrite
+sudo systemctl reload apache2
+```
+
+**4. Test the endpoints**
+
+```bash
+# Road cache (first call hits Overpass; subsequent calls return cached data)
+curl "http://example.com/api/roads?south=48.1&west=11.5&north=48.2&east=11.6"
+
+# Submit an anonymous trip plan
+curl -X POST http://example.com/api/trips \
+     -H "Content-Type: application/json" \
+     -d '{"south":48.1,"west":11.5,"north":48.2,"east":11.6}'
+
+# Query overlapping trip plans
+curl "http://example.com/api/trips?south=48.1&west=11.5&north=48.2&east=11.6"
+```
+
+### API reference
+
+| Method | Path | Body / Query params | Response |
+|--------|------|---------------------|----------|
+| `GET` | `/api/roads` | `south`, `west`, `north`, `east` (float) | `{ ways[], cached: bool }` |
+| `GET` | `/api/trips` | `south`, `west`, `north`, `east` (float) | `{ count, trips[] }` |
+| `POST` | `/api/trips` | JSON `{ south, west, north, east }` | `201 { id }` |
+
+Road tiles are cached for **24 hours** keyed by a 0.01° (~1 km) tile-quantised
+bounding box.  Trip plans expire after **24 hours** and are pruned lazily on
+every request.
+
 ## Tech stack
 
 - [Leaflet.js 1.9](https://leafletjs.com/) – map rendering
@@ -128,5 +224,7 @@ always sees each new build as a newer version.
 - [OpenStreetMap Overpass API](https://overpass-api.de/) – road data
 - [Android WebView](https://developer.android.com/reference/android/webkit/WebView) + Kotlin – native Android packaging
 - [Fused Location Provider](https://developers.google.com/location-context/fused-location-provider) – native GPS on Android
+- PHP 8.0+ / MySQL 5.7+ (optional persistent backend – `apps/wild/`)
 
-No framework, no build step, no back-end required.
+No framework, no build step required for the front-end.  
+The PHP backend requires PHP ≥ 8.0 with PDO + pdo_mysql, and MySQL ≥ 5.7 or MariaDB ≥ 10.3.

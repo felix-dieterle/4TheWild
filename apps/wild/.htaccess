@@ -1,0 +1,24 @@
+# Apache URL rewriting for the 4TheWild PHP backend
+#
+# Routes all /api/* requests to api.php so that the front-end can call
+# /api/roads and /api/trips without a .php suffix.
+#
+# Requirements: mod_rewrite must be enabled.
+#   sudo a2enmod rewrite
+#
+# Place this file (or its parent directory) under your Apache DocumentRoot
+# and ensure AllowOverride All (or AllowOverride FileInfo Options) is set
+# for the containing <Directory>.
+
+Options -Indexes
+Options +FollowSymLinks
+
+RewriteEngine On
+
+# Pass through real files (CSS, images, etc.)
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Route /api/* to api.php
+RewriteRule ^api/ api.php [L,QSA]
