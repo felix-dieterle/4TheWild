@@ -1273,7 +1273,7 @@ async function runAnalysis() {
     ]);
 
     if (!ways.length) {
-      showStatus('⚠️ No road data found in this area. Try zooming in or panning.', 'error');
+      showStatus('⚠️ No road data found. The Overpass API may be temporarily unavailable — try again in a moment, or pan to an area with cached data.', 'error');
       return;
     }
 
@@ -1319,8 +1319,6 @@ async function runAnalysis() {
       showStatus('❌ Request timed out. Try a smaller area or retry in a moment.', 'error');
     } else if (err.status === 429) {
       showStatus('⚠️ Overpass API rate limit reached. Please wait a moment and try again.', 'error');
-    } else if (err.status === 504 || err.status === 502) {
-      showStatus('⚠️ All Overpass API mirrors failed after retrying (504/502). Please retry in a minute or try a smaller area.', 'error');
     } else {
       showStatus(`❌ Error: ${err.message}`, 'error');
     }
@@ -1378,9 +1376,15 @@ async function fetchRoads(bounds) {
 
   const query = `[out:json][timeout:${OVERPASS_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
 
-  const elements = await fetchFromOverpass(query);
-  setCachedRoads(bounds, elements);
-  return elements;
+  try {
+    const elements = await fetchFromOverpass(query);
+    setCachedRoads(bounds, elements);
+    return elements;
+  } catch (err) {
+    console.warn('Road fetch from Overpass failed:', err.message);
+    logError('Roads', `Overpass unavailable: ${err.message}`, err.status);
+    return [];
+  }
 }
 
 /**
