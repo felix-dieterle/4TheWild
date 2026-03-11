@@ -220,31 +220,119 @@ let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
 let locationMarker  = null; /* current-position marker */
 let locationCircle  = null; /* accuracy circle around current position */
-let locationWatchId = null; /* watchPosition handle (string on Capacitor, number in browser) */
+let locationWatchId = null; /* watchPosition handle (string on Android/Capacitor, number in browser) */
 let hasCenteredOnUser = false; /* true once the map has been auto-panned to the user */
 let vegetationLayer = null; /* optional vegetation polygon overlay */
 let terrainLayer    = null; /* optional terrain difficulty overlay */
 
-/* ── Capacitor helpers ───────────────────────────────────────────── */
+/* ── Native platform helpers ────────────────────────────────────── */
 
-/** Returns true when running inside a Capacitor-wrapped native app. */
+/** Returns true when running inside the native Android WebView app. */
+const isNativeAndroid = () => typeof window.Android !== 'undefined';
+
+/** Returns true when running inside any native app context. */
 const isNative = () =>
-  typeof window.Capacitor !== 'undefined' &&
-  typeof window.Capacitor.isNativePlatform === 'function' &&
-  window.Capacitor.isNativePlatform();
+  isNativeAndroid() ||
+  (typeof window.Capacitor !== 'undefined' &&
+   typeof window.Capacitor.isNativePlatform === 'function' &&
+   window.Capacitor.isNativePlatform());
+
+/* ── Android geolocation bridge ─────────────────────────────────── */
+/* Maps callback IDs to pending Promise handlers or ongoing watch    */
+/* subscriptions.  Persistent entries (watchPosition) survive until  */
+/* clearWatch() is called.                                           */
+const _androidGeoCallbacks = {};
+let   _androidCallbackSeq  = 0;
+
+/**
+ * Invoked by the native Android layer to deliver a geolocation response.
+ * err and result are JS objects embedded directly in the evaluateJavascript
+ * call, so no JSON.parse() is needed on this side.
+ * @param {string}      id         Callback ID passed to Android.xxx()
+ * @param {object|null} err        Error object {code, message}, or null
+ * @param {object|null} result     Result payload, or null
+ * @param {boolean}     persistent If true, the entry is NOT removed (watch)
+ */
+window._androidGeoCallback = (id, err, result, persistent) => {
+  const entry = _androidGeoCallbacks[id];
+  if (!entry) return;
+  if (!persistent) delete _androidGeoCallbacks[id];
+  if (err) {
+    const e = Object.assign(new Error(err.message || 'Location error'), { code: err.code });
+    if (entry.reject)  entry.reject(e);
+    if (entry.onError) entry.onError(e);
+  } else {
+    if (entry.resolve)   entry.resolve(result);
+    if (entry.onSuccess) entry.onSuccess(result);
+  }
+};
+
+/** Generate a unique, JS-safe callback ID. */
+function _androidGenId() {
+  return `a${Date.now()}x${(++_androidCallbackSeq).toString(36)}`;
+}
+
+/** Call an Android bridge method and return a one-shot Promise. */
+function _androidCall(method, ...args) {
+  return new Promise((resolve, reject) => {
+    const id = _androidGenId();
+    _androidGeoCallbacks[id] = { resolve, reject, persistent: false };
+    window.Android[method](id, ...args);
+  });
+}
+
+/**
+ * Shim that wraps the Android JavaScript bridge to present the same
+ * Promise-based API as the Capacitor Geolocation plugin, so the rest of
+ * the app code can remain unchanged.
+ */
+const AndroidGeolocation = isNativeAndroid() ? {
+  getCurrentPosition: opts =>
+    _androidCall('getCurrentPosition', !!(opts && opts.enableHighAccuracy)),
+
+  checkPermissions: () =>
+    _androidCall('checkPermissions')
+      .then(r => ({ location: r.state, coarseLocation: r.state })),
+
+  requestPermissions: () =>
+    _androidCall('requestPermissions')
+      .then(r => ({ location: r.state, coarseLocation: r.state })),
+
+  watchPosition: (opts, callback) => {
+    const id = _androidGenId();
+    _androidGeoCallbacks[id] = { onSuccess: callback, onError: e => console.debug('watchPosition error:', e), persistent: true };
+    window.Android.watchPosition(id, !!(opts && opts.enableHighAccuracy));
+    return Promise.resolve(id);
+  },
+
+  clearWatch: ({ id }) => {
+    delete _androidGeoCallbacks[id];
+    window.Android.clearWatch(id);
+  },
+} : null;
+
+/**
+ * Returns the active native Geolocation plugin, or null in a plain browser
+ * context where navigator.geolocation is used directly.
+ */
+const NativeGeolocation = () => {
+  if (isNativeAndroid()) return AndroidGeolocation;
+  if (typeof window.Capacitor !== 'undefined' && window.Capacitor?.Plugins?.Geolocation)
+    return window.Capacitor.Plugins.Geolocation;
+  return null;
+};
 
 /**
  * Resolve the device's current position.
- * Uses the Capacitor Geolocation plugin in a native context so that Android
- * shows the runtime permission dialog; falls back to navigator.geolocation in
- * the browser.
+ * Uses the native Android bridge or Capacitor Geolocation plugin when in a
+ * native context so that Android shows the runtime permission dialog; falls
+ * back to navigator.geolocation in the browser.
  * @param {PositionOptions} [opts]
  * @returns {Promise<GeolocationPosition>}
  */
 function fetchCurrentPosition(opts) {
-  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
-    return window.Capacitor.Plugins.Geolocation.getCurrentPosition(opts);
-  }
+  const geo = NativeGeolocation();
+  if (geo) return geo.getCurrentPosition(opts);
   return new Promise((resolve, reject) => {
     navigator.geolocation.getCurrentPosition(resolve, reject, opts);
   });
@@ -252,7 +340,7 @@ function fetchCurrentPosition(opts) {
 
 /* ── Map initialisation ──────────────────────────────────────────── */
 /* tap:false disables Leaflet's custom tap emulation so that the     */
-/* Capacitor WebView can rely on native touch-to-click conversion.   */
+/* Android WebView can rely on native touch-to-click conversion.     */
 /* Without this, marker popups are not triggered by touch on Android.*/
 const map = L.map('map', { zoomControl: true, tap: false }).setView([47.7728, 9.0883], 13);
 
@@ -317,9 +405,9 @@ function startLocationWatch() {
     updateLocationStatus();
   }
 
-  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
-    window.Capacitor.Plugins.Geolocation
-      .watchPosition(opts, onPosition)
+  const geo = NativeGeolocation();
+  if (geo) {
+    geo.watchPosition(opts, onPosition)
       .then(id  => { locationWatchId = id; })
       .catch(e  => console.debug('watchPosition failed:', e));
   } else if (navigator.geolocation) {
@@ -338,8 +426,9 @@ function stopLocationWatch() {
   if (locationWatchId === null) return;
   const id = locationWatchId;
   locationWatchId = null;
-  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
-    window.Capacitor.Plugins.Geolocation.clearWatch({ id }).catch(e => console.debug('clearWatch error:', e));
+  const geo = NativeGeolocation();
+  if (geo) {
+    try { geo.clearWatch({ id }); } catch { /* ignore */ }
   } else if (navigator.geolocation) {
     navigator.geolocation.clearWatch(id);
   }
@@ -349,8 +438,8 @@ window.addEventListener('beforeunload', stopLocationWatch);
 
 /**
  * Check the current geolocation permission state and update the Location
- * card in the sidebar.  Supports both the Capacitor Geolocation plugin
- * (native app) and the browser Permissions API (web context).
+ * card in the sidebar.  Supports the native Android bridge, the Capacitor
+ * Geolocation plugin, and the browser Permissions API.
  */
 async function updateLocationStatus() {
   const permStatusEl = document.getElementById('locationPermStatus');
@@ -359,9 +448,10 @@ async function updateLocationStatus() {
 
   let state = 'unavailable'; /* 'granted' | 'denied' | 'prompt' | 'unavailable' */
 
-  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+  const geo = NativeGeolocation();
+  if (geo) {
     try {
-      const perm = await window.Capacitor.Plugins.Geolocation.checkPermissions();
+      const perm = await geo.checkPermissions();
       if (perm.location === 'granted' || perm.coarseLocation === 'granted') {
         state = 'granted';
       } else if (perm.location === 'denied' || perm.coarseLocation === 'denied') {
@@ -425,12 +515,13 @@ async function updateLocationStatus() {
   /* as the app loads, before the actual permission dialog appears.          */
   await updateLocationStatus();
 
-  /* In a native Capacitor context, request location permission first.     */
-  /* Use a separate try-catch so a failed requestPermissions() call never  */
-  /* prevents the position watch below from running.                       */
-  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+  /* In a native context, request location permission first.           */
+  /* Use a separate try-catch so a failed requestPermissions() call   */
+  /* never prevents the position watch below from running.            */
+  const geo = NativeGeolocation();
+  if (geo) {
     try {
-      await window.Capacitor.Plugins.Geolocation.requestPermissions();
+      await geo.requestPermissions();
     } catch (e) { console.debug('requestPermissions failed on startup:', e); }
   }
   /* Start the continuous watch; the first fix will pan the map and place  */
@@ -457,8 +548,8 @@ new LocateControl({ position: 'bottomright' }).addTo(map);
 /**
  * Request the device's current GPS position, pan the map to it, and place
  * a pulsing marker with an accuracy circle.
- * On Android (Capacitor) this first requests the runtime location permission
- * so the OS permission dialog is shown to the user if needed.
+ * On Android this first requests the runtime location permission so the OS
+ * permission dialog is shown to the user if needed.
  */
 async function locateMe() {
   /* Write a message directly into the Location card so the user always gets
@@ -482,8 +573,9 @@ async function locateMe() {
     return;
   }
   try {
-    if (isNative() && window.Capacitor.Plugins?.Geolocation) {
-      const perm = await window.Capacitor.Plugins.Geolocation.requestPermissions();
+    const geo = NativeGeolocation();
+    if (geo) {
+      const perm = await geo.requestPermissions();
       if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
         /* The system could not show the permission dialog (permanently denied).
          * Direct the user to the device Settings so they can grant the
@@ -498,14 +590,12 @@ async function locateMe() {
         if (btn) btn.classList.remove('hidden');
         return;
       }
-    } else if (isNative()) {
-      /* Native context but plugin not available – fall through to navigator.geolocation */
-      if (!navigator.geolocation) {
-        setLocationMsg('❌ Geolocation is not supported on this device.', 'error');
-        const btn = document.getElementById('enableLocationBtn');
-        if (btn) btn.classList.add('hidden');
-        return;
-      }
+    } else if (isNative() && !navigator.geolocation) {
+      /* Native context without a geolocation bridge and no browser API. */
+      setLocationMsg('❌ Geolocation is not supported on this device.', 'error');
+      const btn = document.getElementById('enableLocationBtn');
+      if (btn) btn.classList.add('hidden');
+      return;
     }
     const { coords } = await fetchCurrentPosition({ enableHighAccuracy: true, timeout: 30_000 });
     const { latitude: lat, longitude: lng, accuracy } = coords;

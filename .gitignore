@@ -8,6 +8,6 @@ android/.gradle/
 android/build/
 android/local.properties
 
-# Generated web assets directory for Capacitor
-www/
+# Web assets bundled into the Android project during build
+android/app/src/main/assets/www/
 
