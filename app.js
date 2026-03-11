@@ -697,6 +697,237 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) updateLocationStatus();
 });
 
+/* ── Navigation ──────────────────────────────────────────────────── */
+
+/**
+ * Base URLs for geocoding and routing.
+ * Nominatim is used for address → coordinates lookup.
+ * OSRM provides free turn-by-turn routing based on OpenStreetMap data.
+ */
+const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org';
+const OSRM_BASE      = 'https://router.project-osrm.org';
+
+/** Polyline colour for each OSRM travel profile. */
+const NAV_MODE_COLORS = {
+  driving: '#60a5fa', /* blue  – matches --accent2 */
+  cycling: '#4ade80', /* green – matches --accent  */
+  foot:    '#f59e0b', /* amber */
+};
+
+/** Leaflet layer group holding the active route polyline and markers. */
+let routeLayer = null;
+
+/** Travel mode currently selected: 'driving' | 'cycling' | 'foot' */
+let navMode = 'driving';
+
+/* Wire up travel-mode toggle buttons */
+document.querySelectorAll('.nav-mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-mode-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    navMode = btn.dataset.mode;
+  });
+});
+
+/**
+ * Display a message in the navigation status area.
+ * @param {string} msg
+ * @param {'info'|'success'|'error'} type
+ */
+function showNavStatus(msg, type = 'info') {
+  const el = document.getElementById('navStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.className   = `status ${type}`;
+  el.classList.remove('hidden');
+}
+
+/** Hide the navigation status area. */
+function hideNavStatus() {
+  const el = document.getElementById('navStatus');
+  if (el) el.classList.add('hidden');
+}
+
+/**
+ * Geocode a free-text address using the Nominatim API.
+ * Returns { lat, lon, displayName } on success, or null if not found.
+ * @param {string} query
+ * @returns {Promise<{lat:number,lon:number,displayName:string}|null>}
+ */
+async function geocodeAddress(query) {
+  const url = `${NOMINATIM_BASE}/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+  const lang = navigator.language || 'en';
+  const resp = await fetch(url, { headers: { 'Accept-Language': lang } });
+  if (!resp.ok) throw new Error(`Geocoding request failed (HTTP ${resp.status})`);
+  const results = await resp.json();
+  if (!results.length) return null;
+  const { lat, lon, display_name: displayName } = results[0];
+  return { lat: parseFloat(lat), lon: parseFloat(lon), displayName };
+}
+
+/**
+ * Fetch a route from OSRM between two coordinate pairs.
+ * @param {number} fromLat  Start latitude
+ * @param {number} fromLon  Start longitude
+ * @param {number} toLat    End latitude
+ * @param {number} toLon    End longitude
+ * @param {string} profile  OSRM profile: 'driving' | 'cycling' | 'foot'
+ * @returns {Promise<{coordinates:Array,distance:number,duration:number}>}
+ */
+async function fetchRoute(fromLat, fromLon, toLat, toLon, profile) {
+  const coords = `${fromLon},${fromLat};${toLon},${toLat}`;
+  const url = `${OSRM_BASE}/route/v1/${profile}/${coords}?overview=full&geometries=geojson`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Routing request failed (HTTP ${resp.status})`);
+  const data = await resp.json();
+  if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
+    throw new Error('No route found for the given locations.');
+  }
+  const route = data.routes[0];
+  return {
+    coordinates: route.geometry.coordinates, /* [lon, lat] pairs */
+    distance:    route.distance,             /* metres            */
+    duration:    route.duration,             /* seconds           */
+  };
+}
+
+/**
+ * Format a distance in metres to a human-readable string.
+ * @param {number} metres
+ * @returns {string}
+ */
+function formatDistance(metres) {
+  if (metres >= 1000) return `${(metres / 1000).toFixed(1)} km`;
+  return `${Math.round(metres)} m`;
+}
+
+/**
+ * Format a duration in seconds to a human-readable string.
+ * @param {number} seconds
+ * @returns {string}
+ */
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  if (h > 0) return `${h} h ${m} min`;
+  if (m < 1) return '< 1 min';
+  return `${m} min`;
+}
+
+/** Remove the currently displayed route from the map. */
+function clearRoute() {
+  if (routeLayer) {
+    map.removeLayer(routeLayer);
+    routeLayer = null;
+  }
+  document.getElementById('navInfo').classList.add('hidden');
+  document.getElementById('clearRouteBtn').classList.add('hidden');
+  hideNavStatus();
+}
+
+/**
+ * Geocode the destination, calculate the route from the user's current
+ * position (or the map centre) and render it on the map.
+ */
+async function calculateRoute() {
+  const destInput = document.getElementById('navDestInput');
+  const query = destInput ? destInput.value.trim() : '';
+  if (!query) {
+    showNavStatus('⚠️ Please enter a destination.', 'error');
+    return;
+  }
+
+  const calcBtn = document.getElementById('calcRouteBtn');
+  calcBtn.disabled = true;
+  showNavStatus('⏳ Looking up destination…', 'info');
+
+  try {
+    /* 1. Geocode the destination */
+    const dest = await geocodeAddress(query);
+    if (!dest) {
+      showNavStatus('❌ Destination not found. Please try a different search term.', 'error');
+      return;
+    }
+
+    showNavStatus('⏳ Calculating route…', 'info');
+
+    /* 2. Determine origin: prefer the live location marker; fall back to the
+     *    current map centre so the feature works even without GPS.            */
+    let fromLat, fromLon;
+    if (locationMarker) {
+      const ll = locationMarker.getLatLng();
+      fromLat = ll.lat;
+      fromLon = ll.lng;
+    } else {
+      const centre = map.getCenter();
+      fromLat = centre.lat;
+      fromLon = centre.lng;
+    }
+
+    /* 3. Fetch the route from OSRM */
+    const route = await fetchRoute(fromLat, fromLon, dest.lat, dest.lon, navMode);
+
+    /* 4. Render the route on the map */
+    clearRoute();
+    routeLayer = L.layerGroup();
+
+    /* Route polyline – GeoJSON coordinates are [lon, lat] */
+    const latLngs = route.coordinates.map(([lon, lat]) => [lat, lon]);
+    const modeColors = NAV_MODE_COLORS;
+    const lineColor  = modeColors[navMode] || NAV_MODE_COLORS.driving;
+
+    L.polyline(latLngs, { color: lineColor, weight: 5, opacity: 0.85 }).addTo(routeLayer);
+
+    /* Origin marker */
+    L.marker([fromLat, fromLon], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="route-pin route-pin-start">A</div>',
+        iconSize:   [26, 26],
+        iconAnchor: [13, 13],
+      }),
+    }).bindPopup('📍 Start').addTo(routeLayer);
+
+    /* Destination marker */
+    L.marker([dest.lat, dest.lon], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="route-pin route-pin-end">B</div>',
+        iconSize:   [26, 26],
+        iconAnchor: [13, 13],
+      }),
+    }).bindPopup(`📌 ${dest.displayName}`).addTo(routeLayer);
+
+    routeLayer.addTo(map);
+
+    /* Fit the map to the route bounds */
+    map.fitBounds(L.latLngBounds(latLngs), { padding: [40, 40] });
+
+    /* 5. Show route info */
+    document.getElementById('navDistance').textContent =
+      `📏 ${formatDistance(route.distance)}`;
+    document.getElementById('navDuration').textContent =
+      `⏱ ${formatDuration(route.duration)}`;
+    document.getElementById('navInfo').classList.remove('hidden');
+    document.getElementById('clearRouteBtn').classList.remove('hidden');
+    hideNavStatus();
+
+  } catch (err) {
+    console.warn('Navigation error:', err.message);
+    showNavStatus(`❌ ${err.message}`, 'error');
+  } finally {
+    calcBtn.disabled = false;
+  }
+}
+
+document.getElementById('calcRouteBtn').addEventListener('click', calculateRoute);
+document.getElementById('clearRouteBtn').addEventListener('click', clearRoute);
+
+/* Allow pressing Enter in the destination field to trigger the calculation */
+document.getElementById('navDestInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') calculateRoute();
+});
+
 /* ── Mobile sidebar toggle ───────────────────────────────────────── */
 function openSidebar() {
   sidebarEl.classList.remove('hidden-mobile');

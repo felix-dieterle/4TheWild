@@ -291,6 +291,18 @@ footer a { color: var(--accent2); text-decoration: none; }
   touch-action: manipulation;
 }
 
+/* ── Route pin markers ──────────────────────────────────────────── */
+.route-pin {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  font-size: 0.72rem; font-weight: 700; color: #111;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+}
+.route-pin-start { background: #4ade80; }
+.route-pin-end   { background: #f87171; }
+
 /* ── GPS Locate control ─────────────────────────────────────────── */
 .locate-btn {
   width: 36px;
@@ -348,6 +360,67 @@ footer a { color: var(--accent2); text-decoration: none; }
   border-radius: 6px;
   font-size: 0.75rem;
 }
+
+/* ── Navigation card ─────────────────────────────────────────────── */
+#navDestInput {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  outline: none;
+  margin-bottom: 8px;
+  transition: border-color 0.15s;
+}
+#navDestInput:focus { border-color: var(--accent2); }
+#navDestInput::placeholder { color: var(--muted); }
+
+.nav-mode-group {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.nav-mode-btn {
+  flex: 1;
+  padding: 7px 6px;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.nav-mode-btn:hover { border-color: var(--accent2); color: var(--text); filter: none; }
+.nav-mode-btn.active {
+  border-color: var(--accent2);
+  color: var(--accent2);
+  background: var(--surface);
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  margin-top: 6px;
+}
+button.secondary:hover { color: var(--danger); border-color: var(--danger); filter: none; }
+
+.nav-info {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+.nav-info span { color: var(--accent); font-weight: 600; }
 
 /* ── Map loading overlay ─────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
