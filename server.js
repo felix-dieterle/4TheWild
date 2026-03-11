@@ -158,7 +158,7 @@ async function fetchOverpassRoads(s, w, n, e) {
     } catch (err) {
       lastErr = err;
       /* Only retry on gateway/timeout/network errors – not on 400 Bad Request etc. */
-      const retryable = err.statusCode === 504 || err.statusCode === 502 ||
+      const retryable = err.statusCode === 504 || err.statusCode === 502 || err.statusCode === 429 ||
                         err.message === 'Overpass request timed out' ||
                         err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' ||
                         err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED';

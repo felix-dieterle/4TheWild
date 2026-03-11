@@ -254,6 +254,8 @@ let heatLayer       = null;
 let quietMarkers    = [];
 let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
+/** In-memory log of HTTP/API errors recorded during the session. */
+const errorLog      = [];
 let locationMarker  = null; /* current-position marker */
 let locationCircle  = null; /* accuracy circle around current position */
 let locationWatchId = null; /* watchPosition handle (string on Android/Capacitor, number in browser) */
@@ -687,7 +689,13 @@ const sidebarOverlay  = document.getElementById('sidebarOverlay');
 const vegDampeningCb  = document.getElementById('vegDampening');
 const showTerrainCb   = document.getElementById('showTerrain');
 const useRailwaysCb   = document.getElementById('useRailways');
-const terrainLegendEl = document.getElementById('terrainLegend');
+const terrainLegendEl  = document.getElementById('terrainLegend');
+const errorLogCard     = document.getElementById('errorLogCard');
+const errorLogList     = document.getElementById('errorLogList');
+const errorLogBadge    = document.getElementById('errorLogBadge');
+const errorLogToggle   = document.getElementById('errorLogToggle');
+const errorLogClearBtn = document.getElementById('errorLogClearBtn');
+const errorLogBody     = document.getElementById('errorLogBody');
 
 document.getElementById('enableLocationBtn')?.addEventListener('click', locateMe);
 
@@ -1306,8 +1314,11 @@ async function runAnalysis() {
     );
   } catch (err) {
     console.error(err);
+    logError('Analysis', err.message, err.status);
     if (err.name === 'AbortError') {
       showStatus('❌ Request timed out. Try a smaller area.', 'error');
+    } else if (err.status === 429) {
+      showStatus('⚠️ Overpass API rate limit reached. Please wait a moment and try again.', 'error');
     } else {
       showStatus(`❌ Error: ${err.message}`, 'error');
     }
@@ -1506,7 +1517,7 @@ async function fetchFromOverpass(query) {
       } finally {
         clearTimeout(timer);
       }
-      if (resp.status === 504 || resp.status === 502) {
+      if (resp.status === 504 || resp.status === 502 || resp.status === 429) {
         const err = new Error(`HTTP ${resp.status}`);
         err.status = resp.status;
         throw err;
@@ -1517,9 +1528,10 @@ async function fetchFromOverpass(query) {
     } catch (err) {
       lastErr = err;
       const retryable = err.name === 'AbortError' ||
-                        err.status === 504 || err.status === 502 ||
+                        err.status === 504 || err.status === 502 || err.status === 429 ||
                         err.name === 'TypeError'; /* network-level failure */
       if (!retryable) throw err;
+      logError('Overpass', `Mirror ${url} failed: ${err.message}`, err.status);
       console.warn(`Overpass mirror ${url} failed (${err.message}), trying next…`);
     }
   }
@@ -1980,8 +1992,67 @@ function showTripStatus(msg, type = 'info') {
   tripStatusEl.classList.remove('hidden');
 }
 
+/**
+ * Record an error to the in-memory error log and update the error log card.
+ * @param {string} source   Short label identifying the failing operation (e.g. 'Overpass').
+ * @param {string} message  Human-readable error description.
+ * @param {number|undefined} status  HTTP status code, if applicable.
+ */
+function logError(source, message, status) {
+  errorLog.push({ ts: Date.now(), source, message, status });
+  renderErrorLog();
+}
+
+/**
+ * Refresh the error log card to reflect the current contents of `errorLog`.
+ * Shows the card when there are entries and hides it when the log is cleared.
+ */
+function renderErrorLog() {
+  if (!errorLogCard) return;
+  if (errorLog.length === 0) {
+    errorLogCard.classList.add('hidden');
+    return;
+  }
+  errorLogCard.classList.remove('hidden');
+  if (errorLogBadge) errorLogBadge.textContent = errorLog.length;
+
+  if (!errorLogList) return;
+  errorLogList.innerHTML = '';
+  /* Show newest entries first */
+  for (let i = errorLog.length - 1; i >= 0; i--) {
+    const { ts, source, message, status } = errorLog[i];
+    const li  = document.createElement('li');
+    li.className = 'error-log-entry';
+    const time = document.createElement('span');
+    time.className = 'error-log-time';
+    time.textContent = new Date(ts).toLocaleTimeString();
+    const tag = document.createElement('span');
+    tag.className = 'error-log-source';
+    tag.textContent = status ? `${source} ${status}` : source;
+    const msg = document.createElement('span');
+    msg.className = 'error-log-msg';
+    msg.textContent = message;
+    li.append(time, tag, msg);
+    errorLogList.appendChild(li);
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/* ── Error log event listeners ───────────────────────────────────── */
+if (errorLogToggle && errorLogBody) {
+  errorLogToggle.addEventListener('click', () => {
+    const collapsed = errorLogBody.classList.toggle('hidden');
+    errorLogToggle.textContent = collapsed ? '▶' : '▼';
+  });
+}
+if (errorLogClearBtn) {
+  errorLogClearBtn.addEventListener('click', () => {
+    errorLog.length = 0;
+    renderErrorLog();
+  });
 }
 
 /* ── Startup version splash ──────────────────────────────────────── */

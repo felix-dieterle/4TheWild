@@ -81,6 +81,19 @@
         <div id="status" class="status hidden"></div>
       </section>
 
+      <!-- Error Log -->
+      <section class="card hidden" id="errorLogCard">
+        <h2>
+          ⚠️ Error Log
+          <span id="errorLogBadge" class="error-log-badge">0</span>
+          <button id="errorLogToggle" class="error-log-toggle" aria-label="Toggle error log" title="Expand / collapse">▼</button>
+        </h2>
+        <div id="errorLogBody">
+          <ol id="errorLogList" class="error-log-list"></ol>
+          <button id="errorLogClearBtn" class="secondary">🗑 Clear Log</button>
+        </div>
+      </section>
+
       <!-- Heatmap options -->
       <section class="card">
         <h2>Heatmap</h2>
