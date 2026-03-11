@@ -1365,22 +1365,9 @@ async function fetchRoads(bounds) {
 
   const query = `[out:json][timeout:${OVERPASS_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-
-  const resp = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `data=${encodeURIComponent(query)}`,
-    signal: controller.signal,
-  });
-  clearTimeout(timer);
-
-  if (!resp.ok) throw new Error(`Overpass returned HTTP ${resp.status}`);
-  const data = await resp.json();
-  const ways = data.elements || [];
-  setCachedRoads(bounds, ways);
-  return ways;
+  const elements = await fetchFromOverpass(query);
+  setCachedRoads(bounds, elements);
+  return elements;
 }
 
 /**
@@ -1402,18 +1389,8 @@ async function fetchVegetation(bounds) {
     `way["landuse"~"^(forest|meadow|grass|orchard|vineyard)$"](${bbox}););` +
     `out geom;`;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-    const resp = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:   `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const polys = (data.elements || [])
+    const elements = await fetchFromOverpass(query);
+    const polys = elements
       .filter(el => el.geometry && el.geometry.length >= 3)
       .map(el => ({
         type:    el.tags.natural || el.tags.landuse || '',
@@ -1450,18 +1427,8 @@ async function fetchTerrain(bounds) {
     `way["highway"="track"]["tracktype"~"^(grade4|grade5)$"](${bbox}););` +
     `out geom;`;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-    const resp = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:   `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const ways = (data.elements || []).filter(el => el.geometry && el.geometry.length >= 2);
+    const elements = await fetchFromOverpass(query);
+    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
     setCachedTerrain(bounds, ways);
     return ways;
   } catch (err) {
@@ -1488,18 +1455,8 @@ async function fetchRailways(bounds) {
     `way["railway"~"^(rail|tram|subway|light_rail|narrow_gauge|monorail|preserved)$"](${bbox});` +
     `out geom;`;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-    const resp = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:   `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const ways = (data.elements || []).filter(el => el.geometry && el.geometry.length >= 2);
+    const elements = await fetchFromOverpass(query);
+    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
     setCachedRailways(bounds, ways);
     return ways;
   } catch (err) {
@@ -1514,6 +1471,60 @@ const OVERPASS_TIMEOUT_S   = 25;   /* server-side timeout in seconds */
 const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort with grace period */
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
+/**
+ * Public Overpass API mirrors tried in order.  If the primary returns 504 or
+ * times out the next mirror is tried automatically so a single overloaded
+ * instance does not cause a total failure.
+ */
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter',
+];
+
+/**
+ * Post a query to Overpass, automatically retrying against the next mirror
+ * when the primary returns 504 or the request times out.
+ * @param {string} query  OverpassQL query string
+ * @returns {Promise<Array>} Overpass elements array
+ */
+async function fetchFromOverpass(query) {
+  const body = `data=${encodeURIComponent(query)}`;
+  let lastErr;
+  for (const url of OVERPASS_ENDPOINTS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
+      let resp;
+      try {
+        resp = await fetch(url, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+          signal:  controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (resp.status === 504 || resp.status === 502) {
+        const err = new Error(`HTTP ${resp.status}`);
+        err.status = resp.status;
+        throw err;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      return data.elements || [];
+    } catch (err) {
+      lastErr = err;
+      const retryable = err.name === 'AbortError' ||
+                        err.status === 504 || err.status === 502 ||
+                        err.name === 'TypeError'; /* network-level failure */
+      if (!retryable) throw err;
+      console.warn(`Overpass mirror ${url} failed (${err.message}), trying next…`);
+    }
+  }
+  throw lastErr;
+}
 
 /* Speed plausibility bounds for dynamicNoiseFactor().
  * Speeds below MIN_PLAUSIBLE_SPEED_KMH (e.g. a mapped "5" on a cycle path)

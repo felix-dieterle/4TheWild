@@ -35,6 +35,15 @@ const ROAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000; /* road cache expires after 24 ho
 const OVERPASS_QUERY_TIMEOUT_S = 25;
 /** Socket-level abort timeout (ms) – includes network latency on top of query processing. */
 const OVERPASS_TIMEOUT_MS = (OVERPASS_QUERY_TIMEOUT_S + 5) * 1000;
+/**
+ * Public Overpass API mirrors tried in order.  If the primary returns 504 or
+ * times out the next mirror is tried automatically.
+ */
+const OVERPASS_ENDPOINTS = [
+  { hostname: 'overpass-api.de',       path: '/api/interpreter' },
+  { hostname: 'overpass.kumi.systems', path: '/api/interpreter' },
+  { hostname: 'lz4.overpass-api.de',   path: '/api/interpreter' },
+];
 
 /**
  * In-memory trip store.
@@ -85,18 +94,18 @@ function tileForBbox(s, w, n, e) {
 }
 
 /**
- * Fetch road ways from the Overpass API for the given bbox.
- * Returns a Promise that resolves with the elements array.
+ * Attempt a single Overpass request against one endpoint.
+ * Resolves with the elements array or rejects with an error that includes the
+ * HTTP status code so the caller can decide whether to retry.
+ * @param {{ hostname: string, path: string }} endpoint
+ * @param {string} body  URL-encoded query body
+ * @returns {Promise<Array>}
  */
-function fetchOverpassRoads(s, w, n, e) {
+function fetchOverpassOnce(endpoint, body) {
   return new Promise((resolve, reject) => {
-    const bbox  = `${s},${w},${n},${e}`;
-    const query = `[out:json][timeout:${OVERPASS_QUERY_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
-    const body  = `data=${encodeURIComponent(query)}`;
-
     const options = {
-      hostname: 'overpass-api.de',
-      path:     '/api/interpreter',
+      hostname: endpoint.hostname,
+      path:     endpoint.path,
       method:   'POST',
       headers: {
         'Content-Type':   'application/x-www-form-urlencoded',
@@ -109,13 +118,15 @@ function fetchOverpassRoads(s, w, n, e) {
       incoming.on('data', chunk => chunks.push(chunk));
       incoming.on('end', () => {
         if (incoming.statusCode !== 200) {
-          return reject(new Error(`Overpass returned HTTP ${incoming.statusCode}`));
+          const err = new Error(`Overpass returned HTTP ${incoming.statusCode}`);
+          err.statusCode = incoming.statusCode;
+          return reject(err);
         }
         try {
           const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           resolve(data.elements || []);
-        } catch (err) {
-          reject(err);
+        } catch (parseErr) {
+          reject(parseErr);
         }
       });
     });
@@ -127,6 +138,35 @@ function fetchOverpassRoads(s, w, n, e) {
     req.write(body);
     req.end();
   });
+}
+
+/**
+ * Fetch road ways from the Overpass API for the given bbox.
+ * Tries each entry in OVERPASS_ENDPOINTS in order, falling back on 504 or
+ * timeout so a single overloaded mirror does not cause a total failure.
+ * Returns a Promise that resolves with the elements array.
+ */
+async function fetchOverpassRoads(s, w, n, e) {
+  const bbox  = `${s},${w},${n},${e}`;
+  const query = `[out:json][timeout:${OVERPASS_QUERY_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
+  const body  = `data=${encodeURIComponent(query)}`;
+
+  let lastErr;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      return await fetchOverpassOnce(endpoint, body);
+    } catch (err) {
+      lastErr = err;
+      /* Only retry on gateway/timeout/network errors – not on 400 Bad Request etc. */
+      const retryable = err.statusCode === 504 || err.statusCode === 502 ||
+                        err.message === 'Overpass request timed out' ||
+                        err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' ||
+                        err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED';
+      if (!retryable) throw err;
+      console.warn(`Overpass mirror ${endpoint.hostname} failed (${err.message}), trying next…`);
+    }
+  }
+  throw lastErr;
 }
 
 function setCorsHeaders(res) {
