@@ -405,9 +405,24 @@ new LocateControl({ position: 'bottomright' }).addTo(map);
  * so the OS permission dialog is shown to the user if needed.
  */
 async function locateMe() {
+  /* Write a message directly into the Location card so the user always gets
+   * feedback in the section they are looking at, not the Analyze section.   */
+  function setLocationMsg(msg, cls) {
+    const el = document.getElementById('locationPermStatus');
+    if (!el) return;
+    el.textContent = msg;
+    el.className   = `status ${cls}`;
+    el.classList.remove('hidden');
+  }
+
+  /* Give immediate visual feedback on every click, even when repeating the
+   * request in a permanently-denied state where no OS dialog will appear.   */
+  setLocationMsg('⏳ Requesting location…', '');
+
   if (!navigator.geolocation && !isNative()) {
-    showStatus('⚠️ Geolocation is not supported by your browser.', 'error');
-    updateLocationStatus();
+    setLocationMsg('❌ Geolocation is not supported by your browser.', 'error');
+    const btn = document.getElementById('enableLocationBtn');
+    if (btn) btn.classList.add('hidden');
     return;
   }
   try {
@@ -416,16 +431,23 @@ async function locateMe() {
       if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
         /* The system could not show the permission dialog (permanently denied).
          * Direct the user to the device Settings so they can grant the
-         * permission manually.                                                */
-        showStatus('⚠️ Location permanently denied. Please enable it via Settings → Apps → 4TheWild → Permissions → Location.', 'error');
-        updateLocationStatus();
+         * permission manually.  Show the message directly in the Location card
+         * so it is visible even if the Analyze section is out of view.        */
+        setLocationMsg(
+          '❌ Location access permanently denied. ' +
+          'Please open Settings → Apps → 4TheWild → Permissions → Location.',
+          'error',
+        );
+        const btn = document.getElementById('enableLocationBtn');
+        if (btn) btn.classList.remove('hidden');
         return;
       }
     } else if (isNative()) {
       /* Native context but plugin not available – fall through to navigator.geolocation */
       if (!navigator.geolocation) {
-        showStatus('⚠️ Geolocation is not supported on this device.', 'error');
-        updateLocationStatus();
+        setLocationMsg('❌ Geolocation is not supported on this device.', 'error');
+        const btn = document.getElementById('enableLocationBtn');
+        if (btn) btn.classList.add('hidden');
         return;
       }
     }
@@ -435,7 +457,16 @@ async function locateMe() {
     placeLocationMarker(lat, lng, accuracy);
   } catch (err) {
     console.warn('Geolocation error:', err?.message || err);
-    showStatus('⚠️ Location unavailable. Please allow location access.', 'error');
+    /* err.code === 1 means PERMISSION_DENIED – let updateLocationStatus() below
+     * handle hiding / showing the button based on the actual permission state.
+     * For other errors (timeout, GPS unavailable) keep the button visible so
+     * the user can retry without having to go to the device Settings.          */
+    if (err?.code !== 1) {
+      setLocationMsg('⚠️ Could not determine your location. Please try again.', 'error');
+      const btn = document.getElementById('enableLocationBtn');
+      if (btn) btn.classList.remove('hidden');
+      return;
+    }
   }
   updateLocationStatus();
 }
@@ -461,6 +492,12 @@ const showTerrainCb   = document.getElementById('showTerrain');
 const terrainLegendEl = document.getElementById('terrainLegend');
 
 document.getElementById('enableLocationBtn')?.addEventListener('click', locateMe);
+
+/* Refresh location status when the user returns to the app (e.g. after
+ * enabling the permission manually in device Settings).               */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) updateLocationStatus();
+});
 
 /* ── Mobile sidebar toggle ───────────────────────────────────────── */
 function openSidebar() {
