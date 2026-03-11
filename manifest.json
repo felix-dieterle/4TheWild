@@ -1,0 +1,23 @@
+{
+  "name": "4TheWild – Silent Place Finder",
+  "short_name": "4TheWild",
+  "description": "Find the quietest spots near you",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#071409",
+  "theme_color": "#0d2010",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
