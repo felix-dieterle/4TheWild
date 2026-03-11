@@ -367,6 +367,11 @@ async function updateLocationStatus() {
 
 /* Try to center on the user's location, requesting permission if needed */
 (async () => {
+  /* Show the current permission state in the Location card right away so   */
+  /* the user sees the "Enable Location Access" button (or status) as soon  */
+  /* as the app loads, before the actual permission dialog appears.          */
+  await updateLocationStatus();
+
   /* In a native Capacitor context, request location permission first.     */
   /* Use a separate try-catch so a failed requestPermissions() call never  */
   /* prevents the position fetch below from running.                       */
@@ -457,16 +462,28 @@ async function locateMe() {
     placeLocationMarker(lat, lng, accuracy);
   } catch (err) {
     console.warn('Geolocation error:', err?.message || err);
-    /* err.code === 1 means PERMISSION_DENIED – let updateLocationStatus() below
-     * handle hiding / showing the button based on the actual permission state.
-     * For other errors (timeout, GPS unavailable) keep the button visible so
-     * the user can retry without having to go to the device Settings.          */
-    if (err?.code !== 1) {
-      setLocationMsg('⚠️ Could not determine your location. Please try again.', 'error');
+    if (err?.code === 1) {
+      /* PERMISSION_DENIED – show an explicit message so the user knows to go
+       * to Settings.  We must not rely on updateLocationStatus() here because
+       * browsers without the Permissions API (e.g. older Safari) always fall
+       * back to the 'prompt' state and would incorrectly re-show the
+       * "not yet enabled" button instead of the denied message.               */
+      setLocationMsg(
+        isNative()
+          ? '❌ Location access denied. Please enable in device Settings.'
+          : '❌ Location access denied – please enable in your browser or device Settings.',
+        'error',
+      );
       const btn = document.getElementById('enableLocationBtn');
-      if (btn) btn.classList.remove('hidden');
+      if (btn) btn.classList.add('hidden');
       return;
     }
+    /* For other errors (timeout, GPS unavailable) keep the button visible so
+     * the user can retry without having to go to the device Settings.         */
+    setLocationMsg('⚠️ Could not determine your location. Please try again.', 'error');
+    const btn = document.getElementById('enableLocationBtn');
+    if (btn) btn.classList.remove('hidden');
+    return;
   }
   updateLocationStatus();
 }
