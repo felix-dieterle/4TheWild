@@ -1,13 +1,14 @@
 /**
  * 4TheWild – Silent Place Finder
  *
- * Fetches road data from the OpenStreetMap Overpass API and computes a
- * noise-weighted heatmap. Each road type gets a base weight reflecting its
- * typical traffic noise, further refined by a dynamic per-way factor that
- * accounts for the road's tagged speed limit (maxspeed) and lane count.
+ * Fetches road and railway data from the OpenStreetMap Overpass API and
+ * computes a noise-weighted heatmap. Each road/railway type gets a base
+ * weight reflecting its typical traffic noise, further refined by a dynamic
+ * per-way factor that accounts for the way's tagged speed limit (maxspeed)
+ * and, for roads, the lane count.
  * The grid-based score for a point is:
  *
- *   effectiveWeight(s) = baseWeight(highway) × dynamicNoiseFactor(maxspeed, lanes)
+ *   effectiveWeight(s) = baseWeight(highway|railway) × dynamicNoiseFactor(…)
  *   noiseScore(p)      = max over all segments s { effectiveWeight(s) * 1000 / dist(p, s) }
  *                        + tripCount(p) × TRIP_NOISE_PENALTY
  *
@@ -76,6 +77,20 @@ const DEFAULT_ROAD_WEIGHTS = {
   footway:           0.15,
   pedestrian:        0.25,
   steps:             0.1,
+};
+
+/* ── Railway type noise weights (higher = louder) ───────────────────
+ * Base weights for each OSM railway type.  Multiplied at runtime by
+ * dynamicRailwayNoiseFactor() which adjusts for tagged maxspeed.
+ * ──────────────────────────────────────────────────────────────────── */
+const DEFAULT_RAILWAY_WEIGHTS = {
+  rail:         8,  /* main-line / intercity heavy rail            */
+  narrow_gauge: 5,  /* narrow-gauge regional lines                 */
+  light_rail:   4,  /* light rail / Stadtbahn                      */
+  subway:       4,  /* metro / U-Bahn (surface sections)           */
+  tram:         3,  /* tram / Straßenbahn                          */
+  monorail:     3,
+  preserved:    4,  /* heritage / museum railway                   */
 };
 
 /* ── Country-coded maxspeed defaults (km/h) ─────────────────────────
@@ -174,6 +189,19 @@ const DEFAULT_SPEEDS = {
   steps:            3,
 };
 
+/* ── Default speed limits (km/h) by railway type ────────────────────
+ * Used by dynamicRailwayNoiseFactor() when a way has no maxspeed tag.
+ * ──────────────────────────────────────────────────────────────────── */
+const DEFAULT_RAILWAY_SPEEDS = {
+  rail:         120,  /* typical intercity / freight train   */
+  narrow_gauge:  80,
+  light_rail:    70,
+  subway:        60,
+  tram:          40,
+  monorail:      60,
+  preserved:     40,
+};
+
 /* ── Default lane counts by road type ───────────────────────────────
  * Used when a way has no lanes tag.  Motorways count total lanes
  * (both directions combined) since OSM lanes tag does the same.
@@ -212,8 +240,16 @@ const WEIGHT_UI_GROUPS = [
   { label: '🌲 Track/Path',  keys: ['track', 'path', 'footway', 'cycleway', 'pedestrian', 'steps'], default: 0.2 },
 ];
 
+/* Railway type groups shown in the sidebar (label → list of railway values) */
+const RAILWAY_UI_GROUPS = [
+  { label: '🚆 Heavy Rail',  keys: ['rail', 'narrow_gauge'],                  default: 8 },
+  { label: '🚊 Light Rail',  keys: ['light_rail', 'subway', 'monorail'],      default: 4 },
+  { label: '🚋 Tram',        keys: ['tram', 'preserved'],                     default: 3 },
+];
+
 /* ── State ───────────────────────────────────────────────────────── */
 let roadWeights     = { ...DEFAULT_ROAD_WEIGHTS };
+let railwayWeights  = { ...DEFAULT_RAILWAY_WEIGHTS };
 let heatLayer       = null;
 let quietMarkers    = [];
 let tripRects       = []; /* Leaflet rectangles for planned trip areas */
@@ -650,6 +686,7 @@ const sidebarCloseBtn = document.getElementById('sidebarClose');
 const sidebarOverlay  = document.getElementById('sidebarOverlay');
 const vegDampeningCb  = document.getElementById('vegDampening');
 const showTerrainCb   = document.getElementById('showTerrain');
+const useRailwaysCb   = document.getElementById('useRailways');
 const terrainLegendEl = document.getElementById('terrainLegend');
 
 document.getElementById('enableLocationBtn')?.addEventListener('click', locateMe);
@@ -803,6 +840,28 @@ function setCachedTerrain(bounds, ways) {
   catch { /* quota exceeded */ }
 }
 
+/* ── Railway cache (localStorage) ───────────────────────────────── */
+const RAILWAY_CACHE_PREFIX = '4w_railway_';
+
+function railwayCacheKey(bounds) {
+  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
+  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
+  return `${RAILWAY_CACHE_PREFIX}${s},${w},${n},${e}`;
+}
+function getCachedRailways(bounds) {
+  try {
+    const raw = localStorage.getItem(railwayCacheKey(bounds));
+    if (!raw) return null;
+    const { ways, cachedAt } = JSON.parse(raw);
+    if (Date.now() - cachedAt > ROAD_CACHE_TTL_MS) { localStorage.removeItem(railwayCacheKey(bounds)); return null; }
+    return ways;
+  } catch { return null; }
+}
+function setCachedRailways(bounds, ways) {
+  try { localStorage.setItem(railwayCacheKey(bounds), JSON.stringify({ ways, cachedAt: Date.now() })); }
+  catch { /* quota exceeded */ }
+}
+
 /**
  * Register the current map view as an anonymous planned trip.
  * Failures are surfaced to the user but do not block other functionality.
@@ -902,6 +961,39 @@ WEIGHT_UI_GROUPS.forEach(group => {
   weightControls.appendChild(row);
 });
 
+/* ── Build railway weight sliders ────────────────────────────────── */
+const railwayWeightControls = document.getElementById('railwayWeightControls');
+RAILWAY_UI_GROUPS.forEach(group => {
+  const row = document.createElement('div');
+  row.className = 'weight-row';
+
+  const lbl = document.createElement('label');
+  lbl.textContent = group.label;
+  lbl.title = group.keys.join(', ');
+
+  const slider = document.createElement('input');
+  slider.type  = 'range';
+  slider.min   = 0;
+  slider.max   = 10;
+  slider.step  = 0.1;
+  slider.value = group.default;
+
+  const valSpan = document.createElement('span');
+  valSpan.className = 'wval';
+  valSpan.textContent = group.default;
+
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    valSpan.textContent = v;
+    group.keys.forEach(k => { railwayWeights[k] = v; });
+  });
+
+  row.appendChild(lbl);
+  row.appendChild(slider);
+  row.appendChild(valSpan);
+  railwayWeightControls.appendChild(row);
+});
+
 /* ── Heatmap display controls ────────────────────────────────────── */
 opacitySlider.addEventListener('input', () => {
   opacityVal.textContent = Math.round(opacitySlider.value * 100) + '%';
@@ -930,13 +1022,15 @@ async function runAnalysis() {
 
   try {
     const bounds = map.getBounds();
-    const useVeg     = vegDampeningCb.checked;
-    const useTerrain = showTerrainCb.checked;
-    const [ways, plannedTrips, vegetation, terrainWays] = await Promise.all([
+    const useVeg      = vegDampeningCb.checked;
+    const useTerrain  = showTerrainCb.checked;
+    const useRailways = useRailwaysCb.checked;
+    const [ways, plannedTrips, vegetation, terrainWays, railwayWays] = await Promise.all([
       fetchRoads(bounds),
       fetchPlannedTrips(bounds),
-      useVeg     ? fetchVegetation(bounds) : Promise.resolve([]),
-      useTerrain ? fetchTerrain(bounds)    : Promise.resolve([]),
+      useVeg      ? fetchVegetation(bounds) : Promise.resolve([]),
+      useTerrain  ? fetchTerrain(bounds)    : Promise.resolve([]),
+      useRailways ? fetchRailways(bounds)   : Promise.resolve([]),
     ]);
 
     if (!ways.length) {
@@ -950,13 +1044,16 @@ async function runAnalysis() {
     const vegNote = (useVeg && vegetation.length)
       ? `, ${vegetation.length} vegetation area(s) dampening noise`
       : '';
-    showStatus(`🧮 Calculating noise scores for ${ways.length} roads…${tripNote}${vegNote}`, 'info');
+    const railwayNote = (useRailways && railwayWays.length)
+      ? `, ${railwayWays.length} railway way(s) included`
+      : '';
+    showStatus(`🧮 Calculating noise scores for ${ways.length} roads${railwayNote}…${tripNote}${vegNote}`, 'info');
     mapLoadingText.textContent = 'Calculating noise scores…';
 
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
-    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips, vegetation);
+    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips, vegetation, railwayWays);
 
     renderHeatmap(heatPoints);
     renderTripRects(plannedTrips);
@@ -972,7 +1069,8 @@ async function runAnalysis() {
     showStatus(
       `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
       (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
-      (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : ''),
+      (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : '') +
+      (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : ''),
       'success'
     );
   } catch (err) {
@@ -1141,6 +1239,44 @@ async function fetchTerrain(bounds) {
   }
 }
 
+/**
+ * Fetch railway ways (rail, tram, subway, etc.) for the given bounds via
+ * Overpass, caching the result in localStorage.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} Overpass way elements
+ */
+async function fetchRailways(bounds) {
+  const cached = getCachedRailways(bounds);
+  if (cached) return cached;
+
+  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
+  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
+  const query =
+    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
+    `way["railway"~"^(rail|tram|subway|light_rail|narrow_gauge|monorail|preserved)$"](${bbox});` +
+    `out geom;`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:   `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const ways = (data.elements || []).filter(el => el.geometry && el.geometry.length >= 2);
+    setCachedRailways(bounds, ways);
+    return ways;
+  } catch (err) {
+    console.warn('Railway fetch failed:', err.message);
+    return [];
+  }
+}
+
 /* ── Noise computation ───────────────────────────────────────────── */
 const GRID_SIZE = 50; /* points per axis → 50×50 = 2 500 sample points */
 const OVERPASS_TIMEOUT_S   = 25;   /* server-side timeout in seconds */
@@ -1251,7 +1387,31 @@ function dynamicNoiseFactor(highway, tags) {
   return Math.min(MAX_DYNAMIC_NOISE_FACTOR, Math.max(MIN_DYNAMIC_NOISE_FACTOR, speedFactor * lanesFactor));
 }
 
-function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = []) {
+/**
+ * Compute a dynamic noise-level multiplier for a railway way based on its
+ * OSM maxspeed tag, relative to the railway-type default speed.
+ *
+ * Railway noise scales with speed^0.5 (same physical model as roads).
+ * High-speed trains (ICE/TGV at 300+ km/h) are substantially louder than
+ * slow trams; the speed cap is raised to 350 km/h to accommodate them.
+ * Track count (OSM "tracks" tag) is not factored in because it primarily
+ * affects frequency rather than peak noise level.
+ *
+ * @param {string}      railway - OSM railway value
+ * @param {object|null} tags    - Full OSM tag set for the way
+ * @returns {number} Multiplicative noise factor (1.0 = no adjustment)
+ */
+function dynamicRailwayNoiseFactor(railway, tags) {
+  const MAX_TRAIN_SPEED_KMH = 350; /* ICE/TGV/Shinkansen can reach 300+ km/h */
+  const defaultSpeed = DEFAULT_RAILWAY_SPEEDS[railway] || 80;
+  const speed = parseMaxspeed(tags && tags.maxspeed);
+  if (speed <= 0) return 1.0;
+  const clampedSpeed = Math.min(MAX_TRAIN_SPEED_KMH, Math.max(MIN_PLAUSIBLE_SPEED_KMH, speed));
+  const factor = Math.sqrt(clampedSpeed / defaultSpeed);
+  return Math.min(MAX_DYNAMIC_NOISE_FACTOR, Math.max(MIN_DYNAMIC_NOISE_FACTOR, factor));
+}
+
+function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = []) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
@@ -1276,6 +1436,28 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = []) {
        lane count so that, e.g., a 6-lane autobahn at 130 km/h scores
        higher than an untagged 2-lane motorway at the default 110 km/h. */
     const weight = baseWeight * dynamicNoiseFactor(highway, way.tags);
+    const geom = way.geometry;
+    if (!geom || geom.length < 2) continue;
+    for (let i = 0; i < geom.length - 1; i++) {
+      segments.push({
+        ax: geom[i].lon   * mPerLng,
+        ay: geom[i].lat   * mPerLat,
+        bx: geom[i + 1].lon * mPerLng,
+        by: geom[i + 1].lat * mPerLat,
+        weight,
+      });
+    }
+  }
+
+  /* Build railway segments and add them to the shared segments array */
+  for (const way of railways) {
+    const railway = way.tags && way.tags.railway;
+    const baseWeight = railwayWeights[railway] !== undefined
+                        ? railwayWeights[railway]
+                        : DEFAULT_RAILWAY_WEIGHTS[railway] ?? 0;
+    if (baseWeight <= 0) continue;
+    /* Adjust for actual train speed tagged on the way */
+    const weight = baseWeight * dynamicRailwayNoiseFactor(railway, way.tags);
     const geom = way.geometry;
     if (!geom || geom.length < 2) continue;
     for (let i = 0; i < geom.length - 1; i++) {
