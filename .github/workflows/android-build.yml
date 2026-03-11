@@ -16,24 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
       - uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Prepare web assets
-        run: npm run prepare:android
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
 
-      - name: Add Android platform
-        run: npx cap add android
+      - name: Copy web assets into Android project
+        run: |
+          mkdir -p android/app/src/main/assets/www
+          cp index.html app.js style.css android/app/src/main/assets/www/
+          cp -r lib android/app/src/main/assets/www/
 
       - name: Write local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
@@ -59,20 +55,16 @@ jobs:
       - name: Set version code
         run: |
           sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
-          sed -i "s/const APP_BUILD *= *[0-9]\+/const APP_BUILD   = ${{ github.run_number }}/" www/app.js
-
-      - name: Sync web assets to Android
-        run: npx cap sync android
+          sed -i "s/const APP_BUILD *= *[0-9]\+/const APP_BUILD   = ${{ github.run_number }}/" app.js
 
       - name: Build debug APK
         run: |
           cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
+          gradle assembleDebug
 
       - name: Rename APK
         run: |
-          APP_VERSION=$(awk -F"'" '/const APP_VERSION =/ {print $2}' www/app.js)
+          APP_VERSION=$(awk -F"'" '/const APP_VERSION =/ {print $2}' app.js)
           APK_NAME="4TheWild-v${APP_VERSION}-${{ github.run_number }}.apk"
           mv android/app/build/outputs/apk/debug/app-debug.apk "android/app/build/outputs/apk/debug/${APK_NAME}"
           echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
@@ -95,3 +87,4 @@ jobs:
             "android/app/build/outputs/apk/debug/${{ env.APK_NAME }}" \
             --title "Build ${{ github.run_number }}" \
             --generate-notes
+
