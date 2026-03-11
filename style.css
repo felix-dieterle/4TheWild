@@ -55,7 +55,7 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-#branding .logo { font-size: 2rem; }
+#branding .logo { width: 2.5rem; height: 2.5rem; flex-shrink: 0; }
 #branding h1 { font-size: 1.25rem; color: var(--accent); font-weight: 700; }
 #branding p  { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
 
@@ -478,7 +478,7 @@ button.secondary:hover { color: var(--danger); border-color: var(--danger); filt
 
 #versionSplash.splash-fade-out { opacity: 0; }
 
-#versionSplash .splash-logo { font-size: 1.1rem; }
+#versionSplash .splash-logo { width: 1.4rem; height: 1.4rem; flex-shrink: 0; }
 #versionSplash .splash-name { font-weight: 700; color: var(--accent); }
 #versionSplash .splash-version { color: var(--muted); font-size: 0.78rem; }
 
