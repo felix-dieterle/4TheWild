@@ -220,6 +220,8 @@ let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
 let locationMarker  = null; /* current-position marker */
 let locationCircle  = null; /* accuracy circle around current position */
+let locationWatchId = null; /* watchPosition handle (string on Capacitor, number in browser) */
+let hasCenteredOnUser = false; /* true once the map has been auto-panned to the user */
 let vegetationLayer = null; /* optional vegetation polygon overlay */
 let terrainLayer    = null; /* optional terrain difficulty overlay */
 
@@ -293,6 +295,57 @@ function placeLocationMarker(lat, lng, accuracy) {
     }),
   }).bindPopup('📍 Your current location').addTo(map);
 }
+
+/**
+ * Start a continuous position watch that keeps the location dot updated as
+ * the device moves.  The very first fix automatically pans the map to the
+ * user's position (unless the map has already been centred via locateMe).
+ * Safe to call multiple times – an existing watch is stopped first.
+ */
+function startLocationWatch() {
+  stopLocationWatch();
+
+  const opts = { enableHighAccuracy: true, timeout: 30_000 };
+
+  function onPosition({ coords }) {
+    const { latitude: lat, longitude: lng, accuracy } = coords;
+    if (!hasCenteredOnUser) {
+      hasCenteredOnUser = true;
+      map.setView([lat, lng], 12);
+    }
+    placeLocationMarker(lat, lng, accuracy);
+    updateLocationStatus();
+  }
+
+  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+    window.Capacitor.Plugins.Geolocation
+      .watchPosition(opts, onPosition)
+      .then(id  => { locationWatchId = id; })
+      .catch(e  => console.debug('watchPosition failed:', e));
+  } else if (navigator.geolocation) {
+    locationWatchId = navigator.geolocation.watchPosition(
+      onPosition,
+      e => console.debug('watchPosition error:', e),
+      opts,
+    );
+  }
+}
+
+/**
+ * Stop the active position watch, if any.
+ */
+function stopLocationWatch() {
+  if (locationWatchId === null) return;
+  const id = locationWatchId;
+  locationWatchId = null;
+  if (isNative() && window.Capacitor.Plugins?.Geolocation) {
+    window.Capacitor.Plugins.Geolocation.clearWatch({ id }).catch(e => console.debug('clearWatch error:', e));
+  } else if (navigator.geolocation) {
+    navigator.geolocation.clearWatch(id);
+  }
+}
+
+window.addEventListener('beforeunload', stopLocationWatch);
 
 /**
  * Check the current geolocation permission state and update the Location
@@ -374,18 +427,16 @@ async function updateLocationStatus() {
 
   /* In a native Capacitor context, request location permission first.     */
   /* Use a separate try-catch so a failed requestPermissions() call never  */
-  /* prevents the position fetch below from running.                       */
+  /* prevents the position watch below from running.                       */
   if (isNative() && window.Capacitor.Plugins?.Geolocation) {
     try {
       await window.Capacitor.Plugins.Geolocation.requestPermissions();
     } catch (e) { console.debug('requestPermissions failed on startup:', e); }
   }
-  try {
-    const { coords } = await fetchCurrentPosition({ timeout: 10000 });
-    const { latitude: lat, longitude: lng, accuracy } = coords;
-    map.setView([lat, lng], 12);
-    placeLocationMarker(lat, lng, accuracy);
-  } catch (e) { console.debug('Could not center on user location:', e); /* keep default view */ }
+  /* Start the continuous watch; the first fix will pan the map and place  */
+  /* the location dot.  Subsequent fixes keep the dot in sync as the user  */
+  /* moves without re-panning the map.                                     */
+  startLocationWatch();
   updateLocationStatus();
 })();
 
@@ -456,10 +507,13 @@ async function locateMe() {
         return;
       }
     }
-    const { coords } = await fetchCurrentPosition({ enableHighAccuracy: true, timeout: 10000 });
+    const { coords } = await fetchCurrentPosition({ enableHighAccuracy: true, timeout: 30_000 });
     const { latitude: lat, longitude: lng, accuracy } = coords;
+    hasCenteredOnUser = true; /* prevent watchPosition from re-panning */
     map.setView([lat, lng], 14);
     placeLocationMarker(lat, lng, accuracy);
+    /* Ensure the continuous watch is (re-)started so the dot stays live. */
+    if (locationWatchId === null) startLocationWatch();
   } catch (err) {
     console.warn('Geolocation error:', err?.message || err);
     if (err?.code === 1) {
