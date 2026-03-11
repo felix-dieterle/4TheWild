@@ -35,14 +35,19 @@ const ROAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000; /* road cache expires after 24 ho
 const OVERPASS_QUERY_TIMEOUT_S = 25;
 /** Socket-level abort timeout (ms) – includes network latency on top of query processing. */
 const OVERPASS_TIMEOUT_MS = (OVERPASS_QUERY_TIMEOUT_S + 5) * 1000;
+/** Number of full passes through all mirrors before giving up. */
+const OVERPASS_MAX_PASSES = 2;
+/** Base delay (ms) before the second pass – gives overloaded mirrors time to recover. */
+const OVERPASS_RETRY_DELAY_MS = 3000;
 /**
  * Public Overpass API mirrors tried in order.  If the primary returns 504 or
  * times out the next mirror is tried automatically.
  */
 const OVERPASS_ENDPOINTS = [
-  { hostname: 'overpass-api.de',       path: '/api/interpreter' },
-  { hostname: 'overpass.kumi.systems', path: '/api/interpreter' },
-  { hostname: 'lz4.overpass-api.de',   path: '/api/interpreter' },
+  { hostname: 'overpass-api.de',              path: '/api/interpreter' },
+  { hostname: 'overpass.kumi.systems',         path: '/api/interpreter' },
+  { hostname: 'lz4.overpass-api.de',           path: '/api/interpreter' },
+  { hostname: 'overpass.openstreetmap.fr',     path: '/api/interpreter' },
 ];
 
 /**
@@ -144,6 +149,8 @@ function fetchOverpassOnce(endpoint, body) {
  * Fetch road ways from the Overpass API for the given bbox.
  * Tries each entry in OVERPASS_ENDPOINTS in order, falling back on 504 or
  * timeout so a single overloaded mirror does not cause a total failure.
+ * If every mirror fails on a pass it waits OVERPASS_RETRY_DELAY_MS before a
+ * second pass, giving servers a chance to recover.
  * Returns a Promise that resolves with the elements array.
  */
 async function fetchOverpassRoads(s, w, n, e) {
@@ -152,18 +159,23 @@ async function fetchOverpassRoads(s, w, n, e) {
   const body  = `data=${encodeURIComponent(query)}`;
 
   let lastErr;
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      return await fetchOverpassOnce(endpoint, body);
-    } catch (err) {
-      lastErr = err;
-      /* Only retry on gateway/timeout/network errors – not on 400 Bad Request etc. */
-      const retryable = err.statusCode === 504 || err.statusCode === 502 || err.statusCode === 429 ||
-                        err.message === 'Overpass request timed out' ||
-                        err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' ||
-                        err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED';
-      if (!retryable) throw err;
-      console.warn(`Overpass mirror ${endpoint.hostname} failed (${err.message}), trying next…`);
+  for (let pass = 0; pass < OVERPASS_MAX_PASSES; pass++) {
+    if (pass > 0) {
+      await new Promise(r => setTimeout(r, OVERPASS_RETRY_DELAY_MS * pass));
+    }
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+      try {
+        return await fetchOverpassOnce(endpoint, body);
+      } catch (err) {
+        lastErr = err;
+        /* Only retry on gateway/timeout/network errors – not on 400 Bad Request etc. */
+        const retryable = err.statusCode === 504 || err.statusCode === 502 || err.statusCode === 429 ||
+                          err.message === 'Overpass request timed out' ||
+                          err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' ||
+                          err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED';
+        if (!retryable) throw err;
+        console.warn(`Overpass mirror ${endpoint.hostname} failed (${err.message}), trying next…`);
+      }
     }
   }
   throw lastErr;

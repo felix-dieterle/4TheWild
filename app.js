@@ -1316,9 +1316,11 @@ async function runAnalysis() {
     console.error(err);
     logError('Analysis', err.message, err.status);
     if (err.name === 'AbortError') {
-      showStatus('❌ Request timed out. Try a smaller area.', 'error');
+      showStatus('❌ Request timed out. Try a smaller area or retry in a moment.', 'error');
     } else if (err.status === 429) {
       showStatus('⚠️ Overpass API rate limit reached. Please wait a moment and try again.', 'error');
+    } else if (err.status === 504 || err.status === 502) {
+      showStatus('⚠️ All Overpass API mirrors failed after retrying (504/502). Please retry in a minute or try a smaller area.', 'error');
     } else {
       showStatus(`❌ Error: ${err.message}`, 'error');
     }
@@ -1491,48 +1493,62 @@ const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://lz4.overpass-api.de/api/interpreter',
+  'https://overpass.openstreetmap.fr/api/interpreter',
 ];
+/** Number of full passes through all mirrors before giving up. */
+const OVERPASS_MAX_PASSES = 2;
+/** Base delay (ms) before the second pass – gives overloaded mirrors time to recover. */
+const OVERPASS_RETRY_DELAY_MS = 3000;
 
 /**
- * Post a query to Overpass, automatically retrying against the next mirror
- * when the primary returns 504 or the request times out.
+ * Post a query to Overpass, automatically retrying against each mirror in
+ * turn.  If every mirror fails on a pass the function waits
+ * OVERPASS_RETRY_DELAY_MS before starting a second pass, giving overloaded
+ * servers a chance to recover before it throws for good.
  * @param {string} query  OverpassQL query string
  * @returns {Promise<Array>} Overpass elements array
  */
 async function fetchFromOverpass(query) {
   const body = `data=${encodeURIComponent(query)}`;
   let lastErr;
-  for (const url of OVERPASS_ENDPOINTS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-      let resp;
+  for (let pass = 0; pass < OVERPASS_MAX_PASSES; pass++) {
+    if (pass > 0) {
+      /* Brief pause before the second pass so transiently overloaded mirrors
+       * have a moment to recover. */
+      await sleep(OVERPASS_RETRY_DELAY_MS * pass);
+    }
+    for (const url of OVERPASS_ENDPOINTS) {
       try {
-        resp = await fetch(url, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body,
-          signal:  controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
+        let resp;
+        try {
+          resp = await fetch(url, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body,
+            signal:  controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (resp.status === 504 || resp.status === 502 || resp.status === 429) {
+          const err = new Error(`HTTP ${resp.status}`);
+          err.status = resp.status;
+          throw err;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        return data.elements || [];
+      } catch (err) {
+        lastErr = err;
+        const retryable = err.name === 'AbortError' ||
+                          err.status === 504 || err.status === 502 || err.status === 429 ||
+                          err.name === 'TypeError'; /* network-level failure */
+        if (!retryable) throw err;
+        logError('Overpass', `Mirror ${url} failed: ${err.message}`, err.status);
+        console.warn(`Overpass mirror ${url} failed (${err.message}), trying next…`);
       }
-      if (resp.status === 504 || resp.status === 502 || resp.status === 429) {
-        const err = new Error(`HTTP ${resp.status}`);
-        err.status = resp.status;
-        throw err;
-      }
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      return data.elements || [];
-    } catch (err) {
-      lastErr = err;
-      const retryable = err.name === 'AbortError' ||
-                        err.status === 504 || err.status === 502 || err.status === 429 ||
-                        err.name === 'TypeError'; /* network-level failure */
-      if (!retryable) throw err;
-      logError('Overpass', `Mirror ${url} failed: ${err.message}`, err.status);
-      console.warn(`Overpass mirror ${url} failed (${err.message}), trying next…`);
     }
   }
   throw lastErr;
