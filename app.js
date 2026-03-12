@@ -247,6 +247,54 @@ const RAILWAY_UI_GROUPS = [
   { label: '🚋 Tram',        keys: ['tram', 'preserved'],                     default: 3 },
 ];
 
+/* ── Built-in noise weight profiles ───────────────────────────────── *
+ * roadGroups    – one weight per WEIGHT_UI_GROUPS entry (index-aligned) *
+ * railwayGroups – one weight per RAILWAY_UI_GROUPS entry (index-aligned)*
+ * useRailways   – initial state of the railway noise toggle             *
+ * ──────────────────────────────────────────────────────────────────── */
+const NOISE_PROFILES = [
+  {
+    id: 'default',
+    name: '🌿 Default',
+    description: 'Balanced weighting across all road types.',
+    roadGroups:    [10, 8, 5, 3, 2, 1.5, 0.2],
+    railwayGroups: [8, 4, 3],
+    useRailways: true,
+  },
+  {
+    id: 'deep_wilderness',
+    name: '🏔 Deep Wilderness',
+    description: 'Forest tracks and hiking paths also count as noise — find places truly far from all routes.',
+    roadGroups:    [10, 8, 5, 3, 2, 1.5, 3.5],
+    railwayGroups: [8, 4, 3],
+    useRailways: true,
+  },
+  {
+    id: 'cycling',
+    name: '🚲 Cycling Trip',
+    description: 'Quiet spots reachable by bike. Tracks, paths and cycleways are not penalised as noise sources.',
+    roadGroups:    [10, 8, 5, 3, 2, 1, 0],
+    railwayGroups: [6, 3, 2],
+    useRailways: true,
+  },
+  {
+    id: 'motor_only',
+    name: '🚗 Motor Traffic Only',
+    description: 'Only motorised roads count as noise. Footpaths, tracks and railways are ignored.',
+    roadGroups:    [10, 8, 5, 3, 1.5, 0.5, 0],
+    railwayGroups: [8, 4, 3],
+    useRailways: false,
+  },
+  {
+    id: 'absolute_silence',
+    name: '🧘 Absolute Silence',
+    description: 'Maximum weight on every noise source for the deepest possible quiet.',
+    roadGroups:    [10, 9, 7, 5, 3.5, 2.5, 1.5],
+    railwayGroups: [10, 7, 5],
+    useRailways: true,
+  },
+];
+
 /* ── State ───────────────────────────────────────────────────────── */
 let roadWeights     = { ...DEFAULT_ROAD_WEIGHTS };
 let railwayWeights  = { ...DEFAULT_RAILWAY_WEIGHTS };
@@ -1319,6 +1367,11 @@ showTerrainCb.addEventListener('change', () => {
 });
 
 /* ── Build weight sliders ────────────────────────────────────────── */
+
+/* Element references kept so applyProfile() can update sliders later */
+const roadSliderElements    = [];  /* { slider, valSpan } per WEIGHT_UI_GROUPS  */
+const railwaySliderElements = [];  /* { slider, valSpan } per RAILWAY_UI_GROUPS */
+
 WEIGHT_UI_GROUPS.forEach(group => {
   const row = document.createElement('div');
   row.className = 'weight-row';
@@ -1348,6 +1401,7 @@ WEIGHT_UI_GROUPS.forEach(group => {
   row.appendChild(slider);
   row.appendChild(valSpan);
   weightControls.appendChild(row);
+  roadSliderElements.push({ slider, valSpan });
 });
 
 /* ── Build railway weight sliders ────────────────────────────────── */
@@ -1381,7 +1435,202 @@ RAILWAY_UI_GROUPS.forEach(group => {
   row.appendChild(slider);
   row.appendChild(valSpan);
   railwayWeightControls.appendChild(row);
+  railwaySliderElements.push({ slider, valSpan });
 });
+
+/* ── Noise weight profile management ────────────────────────────── */
+
+/** localStorage key for user-saved noise weight profiles. */
+const CUSTOM_PROFILES_KEY = '4tw_custom_profiles';
+
+/** Read user-saved profiles from localStorage (returns [] on failure). */
+function loadCustomProfiles() {
+  try {
+    return JSON.parse(localStorage.getItem(CUSTOM_PROFILES_KEY) || '[]');
+  } catch (e) {
+    console.warn('Could not parse saved profiles from localStorage:', e);
+    return [];
+  }
+}
+
+/**
+ * Persist user-saved profiles to localStorage.
+ * @returns {boolean} true on success, false if storage is unavailable or full.
+ */
+function persistCustomProfiles(profiles) {
+  try {
+    localStorage.setItem(CUSTOM_PROFILES_KEY, JSON.stringify(profiles));
+    return true;
+  } catch (e) {
+    console.warn('Could not save profiles to localStorage:', e);
+    return false;
+  }
+}
+
+/**
+ * Apply a profile object to the weight sliders, roadWeights,
+ * railwayWeights and the railway toggle.
+ * @param {{ roadGroups: number[], railwayGroups: number[], useRailways: boolean }} profile
+ */
+function applyProfile(profile) {
+  profile.roadGroups.forEach((val, i) => {
+    if (i >= roadSliderElements.length) return;
+    const { slider, valSpan } = roadSliderElements[i];
+    slider.value = val;
+    valSpan.textContent = val;
+    WEIGHT_UI_GROUPS[i].keys.forEach(k => { roadWeights[k] = val; });
+  });
+  profile.railwayGroups.forEach((val, i) => {
+    if (i >= railwaySliderElements.length) return;
+    const { slider, valSpan } = railwaySliderElements[i];
+    slider.value = val;
+    valSpan.textContent = val;
+    RAILWAY_UI_GROUPS[i].keys.forEach(k => { railwayWeights[k] = val; });
+  });
+  if (typeof profile.useRailways === 'boolean') {
+    useRailwaysCb.checked = profile.useRailways;
+  }
+}
+
+/**
+ * Capture the current slider values as a profile snapshot.
+ * @returns {{ roadGroups: number[], railwayGroups: number[], useRailways: boolean }}
+ */
+function snapshotCurrentProfile() {
+  return {
+    roadGroups:    roadSliderElements.map(e => parseFloat(e.slider.value)),
+    railwayGroups: railwaySliderElements.map(e => parseFloat(e.slider.value)),
+    useRailways:   useRailwaysCb.checked,
+  };
+}
+
+/**
+ * Render the profile selector bar directly above the weight sliders.
+ * Inserts: [profile <select>] [💾 save] [🗑 delete] + description line.
+ */
+function buildProfileUI() {
+  const weightsCard = document.getElementById('weightsCard');
+
+  /* ── Description paragraph (shown for built-in profiles) ── */
+  const descEl = document.createElement('p');
+  descEl.className = 'profile-desc hint';
+  descEl.textContent = NOISE_PROFILES[0].description;
+
+  /* ── Row: select + buttons ─────────────────────────────── */
+  const row = document.createElement('div');
+  row.className = 'profile-row';
+
+  const select = document.createElement('select');
+  select.id        = 'profileSelect';
+  select.className = 'profile-select';
+  select.setAttribute('aria-label', 'Noise weight profile');
+
+  /** Rebuild all <option> / <optgroup> elements inside the select. */
+  function refreshOptions() {
+    select.innerHTML = '';
+
+    const builtinGrp = document.createElement('optgroup');
+    builtinGrp.label = 'Built-in profiles';
+    NOISE_PROFILES.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value       = p.id;
+      opt.textContent = p.name;
+      opt.title       = p.description;
+      builtinGrp.appendChild(opt);
+    });
+    select.appendChild(builtinGrp);
+
+    const custom = loadCustomProfiles();
+    if (custom.length > 0) {
+      const customGrp = document.createElement('optgroup');
+      customGrp.label = 'Saved profiles';
+      custom.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value       = `custom_${p.id}`;
+        opt.textContent = p.name;
+        customGrp.appendChild(opt);
+      });
+      select.appendChild(customGrp);
+    }
+  }
+
+  refreshOptions();
+
+  /* ── Save button ──────────────────────────────────────── */
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'profile-btn';
+  saveBtn.title     = 'Save current settings as a new profile';
+  saveBtn.textContent = '💾';
+
+  saveBtn.addEventListener('click', () => {
+    const name = prompt('Profile name:', '');
+    if (!name || !name.trim()) return;
+    const profiles = loadCustomProfiles();
+    const id = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `u${Date.now()}${Math.random().toString(36).slice(2, 7)}`;
+    profiles.push({ id, name: name.trim(), ...snapshotCurrentProfile() });
+    if (!persistCustomProfiles(profiles)) {
+      alert('Could not save profile – storage may be full.');
+      return;
+    }
+    refreshOptions();
+    select.value = `custom_${id}`;
+    updateDeleteBtn();
+  });
+
+  /* ── Delete button ────────────────────────────────────── */
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'profile-btn secondary';
+  deleteBtn.title     = 'Delete the selected saved profile';
+  deleteBtn.textContent = '🗑';
+
+  function updateDeleteBtn() {
+    deleteBtn.disabled = !select.value.startsWith('custom_');
+  }
+  updateDeleteBtn();
+
+  deleteBtn.addEventListener('click', () => {
+    if (!select.value.startsWith('custom_')) return;
+    if (!confirm('Delete this saved profile?')) return;
+    const id = select.value.slice(7);
+    const profiles = loadCustomProfiles().filter(p => p.id !== id);
+    persistCustomProfiles(profiles);
+    refreshOptions();
+    select.value = 'default';
+    applyProfile(NOISE_PROFILES[0]);
+    descEl.textContent = NOISE_PROFILES[0].description;
+    updateDeleteBtn();
+  });
+
+  /* ── Selection handler ────────────────────────────────── */
+  select.addEventListener('change', () => {
+    const val = select.value;
+    if (val.startsWith('custom_')) {
+      const cid    = val.slice(7);
+      const custom = loadCustomProfiles().find(p => p.id === cid);
+      if (custom) applyProfile(custom);
+      descEl.textContent = '';
+    } else {
+      const builtin = NOISE_PROFILES.find(p => p.id === val);
+      if (builtin) {
+        applyProfile(builtin);
+        descEl.textContent = builtin.description;
+      }
+    }
+    updateDeleteBtn();
+  });
+
+  row.appendChild(select);
+  row.appendChild(saveBtn);
+  row.appendChild(deleteBtn);
+
+  /* Insert profile row and description before the slider container */
+  weightsCard.insertBefore(row, weightControls);
+  weightsCard.insertBefore(descEl, weightControls);
+}
+
+buildProfileUI();
 
 /* ── Heatmap display controls ────────────────────────────────────── */
 opacitySlider.addEventListener('input', () => {
