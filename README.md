@@ -95,26 +95,50 @@ the CI runner is ephemeral, a new debug keystore would be generated on every run
 meaning each build produces a differently-signed APK that cannot update an
 already-installed version.
 
-To fix this, store a persistent keystore as a repository secret:
+To ensure consistent signing, store a persistent keystore as a repository secret.
+**Two ways to create it:**
 
-1. Generate a keystore once on your local machine (standard Android debug credentials):
-   ```bash
-   keytool -genkeypair -v \
-     -keystore debug.keystore \
-     -alias androiddebugkey \
-     -keyalg RSA -keysize 2048 \
-     -validity 10000 \
-     -storepass android \
-     -keypass android \
-     -dname "CN=Android Debug,O=Android,C=US"
-   ```
-2. Base64-encode the file:
-   ```bash
-   base64 -w 0 debug.keystore   # Linux
-   base64 debug.keystore        # macOS
-   ```
-3. Add the output as a repository secret named **`KEYSTORE_BASE64`**:  
+**Option A – let the CI workflow generate it for you (easiest)**
+
+1. Trigger a build without the secret set (push to `main` or run the workflow manually).
+2. The build will complete with a warning and upload a `keystore-setup` artifact
+   (visible on the Actions run page, retained for 1 day).
+3. Download the artifact, open `KEYSTORE_BASE64.txt`, copy its contents.
+4. Add the value as a repository secret named **`KEYSTORE_BASE64`**:  
    *GitHub → Repository → Settings → Secrets and variables → Actions → New repository secret*
+5. All subsequent builds will use this key automatically.
+
+> ⚠️ The APK produced in step 1 is signed with a temporary key.
+> Once you set the secret (step 4) any future APK can update that first
+> bootstrap APK **only if you re-install it** after the secret is configured.
+> If you want zero-reinstall updates from the very first APK, use Option B.
+
+**Option B – generate the keystore locally first**
+
+```bash
+bash scripts/generate-keystore.sh
+```
+The script creates `debug.keystore`, prints the base64-encoded value, and
+explains each next step.
+
+Alternatively, run the underlying commands manually:
+
+```bash
+keytool -genkeypair -v \
+  -keystore debug.keystore \
+  -alias androiddebugkey \
+  -keyalg RSA -keysize 2048 \
+  -validity 10000 \
+  -storepass android \
+  -keypass android \
+  -dname "CN=Android Debug,O=Android,C=US"
+
+base64 -w 0 debug.keystore   # Linux
+base64 debug.keystore        # macOS
+```
+
+Then add the output as the **`KEYSTORE_BASE64`** repository secret **before** triggering
+your first build.
 
 The workflow will automatically restore this keystore before every build, ensuring
 all APKs share the same signing key and can be installed as updates without
