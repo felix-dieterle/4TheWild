@@ -262,6 +262,11 @@ let locationWatchId = null; /* watchPosition handle (string on Android/Capacitor
 let hasCenteredOnUser = false; /* true once the map has been auto-panned to the user */
 let vegetationLayer = null; /* optional vegetation polygon overlay */
 let terrainLayer    = null; /* optional terrain difficulty overlay */
+/* Noise context saved by computeHeatmap() so individual points can be
+ * scored on demand (e.g. when the user taps the map).               */
+let lastNoiseCtx   = null;  /* {segments, mPerLat, mPerLng, vegetation, plannedTrips} */
+/* Temporary marker placed when the user taps the map */
+let mapClickMarker = null;
 
 /* ── Native platform helpers ────────────────────────────────────── */
 
@@ -928,6 +933,80 @@ async function calculateRoute() {
   }
 }
 
+/**
+ * Calculate and display a route to the given coordinates, bypassing the
+ * geocoding step.  Uses the same travel mode, origin logic, and rendering
+ * as calculateRoute() but accepts a lat/lng pair directly – useful when
+ * the user taps the map or selects a quiet-spot result.
+ * @param {number} lat    Destination latitude
+ * @param {number} lng    Destination longitude
+ * @param {string} label  Human-readable name shown in the destination popup
+ */
+async function navigateToCoords(lat, lng, label) {
+  const calcBtn = document.getElementById('calcRouteBtn');
+  if (calcBtn) calcBtn.disabled = true;
+  showNavStatus('⏳ Calculating route…', 'info');
+
+  /* Scroll the nav card into view so the user sees the progress/result */
+  document.getElementById('navCard')?.scrollIntoView({ behavior: 'smooth' });
+
+  try {
+    /* Prefer the live location marker; fall back to map centre */
+    let fromLat, fromLon;
+    if (locationMarker) {
+      const ll = locationMarker.getLatLng();
+      fromLat = ll.lat;
+      fromLon = ll.lng;
+    } else {
+      const centre = map.getCenter();
+      fromLat = centre.lat;
+      fromLon = centre.lng;
+    }
+
+    const route = await fetchRoute(fromLat, fromLon, lat, lng, navMode);
+    clearRoute();
+    routeLayer = L.layerGroup();
+
+    /* Route polyline */
+    const latLngs  = route.coordinates.map(([lon, rlat]) => [rlat, lon]);
+    const lineColor = NAV_MODE_COLORS[navMode] || NAV_MODE_COLORS.driving;
+    L.polyline(latLngs, { color: lineColor, weight: 5, opacity: 0.85 }).addTo(routeLayer);
+
+    /* Origin marker */
+    L.marker([fromLat, fromLon], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="route-pin route-pin-start">A</div>',
+        iconSize: [26, 26], iconAnchor: [13, 13],
+      }),
+    }).bindPopup('📍 Start').addTo(routeLayer);
+
+    /* Destination marker */
+    L.marker([lat, lng], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="route-pin route-pin-end">B</div>',
+        iconSize: [26, 26], iconAnchor: [13, 13],
+      }),
+    }).bindPopup(`📌 ${label}`).addTo(routeLayer);
+
+    routeLayer.addTo(map);
+    map.fitBounds(L.latLngBounds(latLngs), { padding: [40, 40] });
+
+    document.getElementById('navDistance').textContent = `📏 ${formatDistance(route.distance)}`;
+    document.getElementById('navDuration').textContent = `⏱ ${formatDuration(route.duration)}`;
+    document.getElementById('navInfo').classList.remove('hidden');
+    document.getElementById('clearRouteBtn').classList.remove('hidden');
+    hideNavStatus();
+
+  } catch (err) {
+    console.warn('Navigation error:', err.message);
+    showNavStatus(`❌ ${err.message}`, 'error');
+  } finally {
+    if (calcBtn) calcBtn.disabled = false;
+  }
+}
+
 document.getElementById('calcRouteBtn').addEventListener('click', calculateRoute);
 document.getElementById('clearRouteBtn').addEventListener('click', clearRoute);
 
@@ -957,6 +1036,77 @@ sidebarOverlay.addEventListener('click', closeSidebar);
 if (window.matchMedia('(max-width: 480px)').matches) {
   closeSidebar();
 }
+
+/* ── Map click – point selection, noise info & navigation ─────────── */
+
+/**
+ * Wire up the "Navigate here" button inside a Leaflet popup.
+ * Uses popupopen so the button element is guaranteed to be in the DOM.
+ * @param {L.Marker} marker   The marker whose popup contains the button
+ * @param {number}   lat      Destination latitude
+ * @param {number}   lng      Destination longitude
+ * @param {string}   label    Human-readable destination label
+ */
+function bindPopupNavBtn(marker, lat, lng, label) {
+  marker.on('popupopen', function(ev) {
+    const btn = ev.popup.getElement()?.querySelector('.popup-nav-btn');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      navigateToCoords(lat, lng, label);
+      /* On mobile, open the sidebar so the user can see the nav result */
+      if (window.matchMedia('(max-width: 480px)').matches) openSidebar();
+    });
+  });
+}
+
+map.on('click', function onMapClick(e) {
+  const { lat, lng } = e.latlng;
+
+  /* Remove any existing click marker */
+  if (mapClickMarker) {
+    map.removeLayer(mapClickMarker);
+    mapClickMarker = null;
+  }
+
+  /* Noise score at the clicked point (requires a completed analysis) */
+  const noiseScore = computeNoiseAtPoint(lat, lng);
+  const noiseStr = noiseScore !== null
+    ? `🔊 Noise index: <b>${noiseScore.toFixed(2)}</b>`
+    : '🔊 Noise index: <i>n/a – run analysis first</i>';
+
+  /* Straight-line distance from the user's known location */
+  let accessStr = '';
+  if (locationMarker) {
+    const ll   = locationMarker.getLatLng();
+    const dist = haversineDistanceM(ll.lat, ll.lng, lat, lng);
+    accessStr  = `📏 ${formatDistance(dist)} from your location`;
+  }
+
+  const label    = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  const popupHtml =
+    `<div class="map-click-popup">` +
+    `<b>📍 Selected location</b><br>` +
+    `<span class="mcp-coords">${label}</span><br>` +
+    `${noiseStr}<br>` +
+    (accessStr ? `${accessStr}<br>` : '') +
+    `<button class="popup-nav-btn">🧭 Navigate here</button>` +
+    `</div>`;
+
+  mapClickMarker = L.marker([lat, lng], {
+    icon: L.divIcon({
+      className:   '',
+      html:        '<div class="map-click-marker"></div>',
+      iconSize:    [18, 18],
+      iconAnchor:  [9, 9],
+      popupAnchor: [0, -12],
+    }),
+  })
+    .bindPopup(popupHtml, { maxWidth: 260 })
+    .addTo(map);
+
+  bindPopupNavBtn(mapClickMarker, lat, lng, label);
+  mapClickMarker.openPopup();
+});
 
 /* ── Trip planning ───────────────────────────────────────────────── */
 
@@ -1745,6 +1895,9 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     }
   }
 
+  /* Save context so computeNoiseAtPoint() can score arbitrary clicks */
+  lastNoiseCtx = { segments, mPerLat, mPerLng, vegetation, plannedTrips };
+
   if (!segments.length) {
     return { heatPoints: [], quietestPoints: [] };
   }
@@ -1806,6 +1959,62 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
   const quietestPoints = sorted.slice(0, 5);
 
   return { heatPoints, quietestPoints, maxNoise };
+}
+
+/**
+ * Compute the noise score at a single lat/lng using the segments cached
+ * by the last computeHeatmap() run.  Returns null if no analysis has
+ * been run yet (so the caller can display "n/a").
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {number|null}
+ */
+function computeNoiseAtPoint(lat, lng) {
+  if (!lastNoiseCtx) return null;
+  const { segments, mPerLat, mPerLng, vegetation, plannedTrips } = lastNoiseCtx;
+  if (!segments.length) return 0;
+  const px = lng * mPerLng;
+  const py = lat * mPerLat;
+  let noiseScore = 0;
+  for (const seg of segments) {
+    const dist  = Math.max(MIN_DISTANCE_METERS, ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by));
+    const noise = seg.weight * 1000 / dist;
+    if (noise > noiseScore) noiseScore = noise;
+  }
+  if (vegetation.length) {
+    let maxDamp = 0;
+    for (const vp of vegetation) {
+      if (lat < vp.minLat || lat > vp.maxLat || lng < vp.minLon || lng > vp.maxLon) continue;
+      if (pointInPolygon(lat, lng, vp.geometry)) {
+        const d = VEGETATION_DAMPENING[vp.type] || 0;
+        if (d > maxDamp) maxDamp = d;
+      }
+    }
+    if (maxDamp > 0) noiseScore *= (1 - maxDamp);
+  }
+  const tripCount = plannedTrips.filter(t =>
+    lat >= t.south && lat <= t.north && lng >= t.west && lng <= t.east
+  ).length;
+  noiseScore += tripCount * TRIP_NOISE_PENALTY;
+  return noiseScore;
+}
+
+/**
+ * Straight-line (Haversine) distance in metres between two coordinates.
+ * @param {number} lat1
+ * @param {number} lng1
+ * @param {number} lat2
+ * @param {number} lng2
+ * @returns {number} Distance in metres
+ */
+function haversineDistanceM(lat1, lng1, lat2, lng2) {
+  const R  = 6_371_000;
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lng2 - lng1) * Math.PI / 180;
+  const a  = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 /**
@@ -1898,17 +2107,24 @@ function renderResults(points) {
       popupAnchor: [0, -16],
     });
 
+    const label = `Quiet spot #${rank}`;
     const marker = L.marker([p.lat, p.lng], { icon })
       .bindPopup(
-        `<b>Quiet spot #${rank}</b><br>` +
-        `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`
+        `<div class="map-click-popup">` +
+        `<b>${label}</b><br>` +
+        `<span class="mcp-coords">${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}</span><br>` +
+        `🔊 Noise index: <b>${p.noiseScore.toFixed(2)}</b><br>` +
+        `<button class="popup-nav-btn">🧭 Navigate here</button>` +
+        `</div>`,
+        { maxWidth: 240 }
       )
       .addTo(map);
 
+    bindPopupNavBtn(marker, p.lat, p.lng, label);
     quietMarkers.push(marker);
 
     /* Sidebar result item */
-    const li   = document.createElement('li');
+    const li = document.createElement('li');
     li.className = 'result-item';
     li.innerHTML =
       `<span class="ri-rank">#${rank}</span>` +
@@ -1918,6 +2134,19 @@ function renderResults(points) {
       map.setView([p.lat, p.lng], Math.max(map.getZoom(), 13));
       marker.openPopup();
     });
+
+    /* Navigate button inside the result item */
+    const navBtn = document.createElement('button');
+    navBtn.className = 'ri-nav-btn';
+    navBtn.textContent = '🧭 Navigate';
+    navBtn.title = `Calculate route to ${label}`;
+    navBtn.addEventListener('click', e => {
+      e.stopPropagation(); /* don't also trigger the li click */
+      navigateToCoords(p.lat, p.lng, label);
+      document.getElementById('navCard')?.scrollIntoView({ behavior: 'smooth' });
+    });
+    li.appendChild(navBtn);
+
     resultsList.appendChild(li);
   });
 }

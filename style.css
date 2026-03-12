@@ -196,6 +196,22 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
 .result-item .ri-coords { color: var(--muted); font-size: 0.72rem; display: block; margin-top: 3px; }
 .result-item .ri-score { color: var(--accent2); font-size: 0.72rem; }
 
+/* Navigate button inside each quiet-spot result item */
+.ri-nav-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px 8px;
+  background: transparent;
+  color: var(--accent2);
+  border: 1px solid var(--accent2);
+  border-radius: 5px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ri-nav-btn:hover { background: var(--accent2); color: #111; filter: none; }
+
 /* ── Footer ─────────────────────────────────────────────────────── */
 footer {
   margin-top: auto;
@@ -282,6 +298,55 @@ footer a { color: var(--accent2); text-decoration: none; }
 
 /* ── Leaflet overrides ──────────────────────────────────────────── */
 .leaflet-container { background: #14191f; }
+
+/* Dark-themed popups to match the app's surface colour */
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.6);
+}
+.leaflet-popup-content {
+  font-size: 0.82rem;
+  line-height: 1.55;
+  margin: 8px 12px;
+}
+.leaflet-popup-close-button { color: var(--muted) !important; }
+.leaflet-popup-close-button:hover { color: var(--text) !important; }
+
+/* ── Map-click popup ────────────────────────────────────────────── */
+.map-click-popup .mcp-coords {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* "Navigate here" button inside any popup */
+.popup-nav-btn {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: var(--accent2);
+  color: #111;
+  border: none;
+  border-radius: 5px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.popup-nav-btn:hover { filter: brightness(1.1); }
+
+/* ── Map click pin marker ───────────────────────────────────────── */
+.map-click-marker {
+  width: 18px;
+  height: 18px;
+  background: var(--accent2);
+  border: 2.5px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+}
+
 .quiet-marker {
   display: flex; align-items: center; justify-content: center;
   background: var(--accent); border: 2px solid #fff;
