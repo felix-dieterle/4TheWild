@@ -97,7 +97,14 @@ already-installed version.
 
 To fix this, store a persistent keystore as a repository secret:
 
-1. Generate a keystore once on your local machine (standard Android debug credentials):
+1. Generate a keystore once on your local machine using the provided helper script:
+   ```bash
+   bash scripts/generate-keystore.sh
+   ```
+   The script creates `debug.keystore`, prints the base64-encoded value, and
+   explains each next step.
+
+   Alternatively, run the underlying commands manually:
    ```bash
    keytool -genkeypair -v \
      -keystore debug.keystore \
@@ -107,14 +114,17 @@ To fix this, store a persistent keystore as a repository secret:
      -storepass android \
      -keypass android \
      -dname "CN=Android Debug,O=Android,C=US"
-   ```
-2. Base64-encode the file:
-   ```bash
+
    base64 -w 0 debug.keystore   # Linux
    base64 debug.keystore        # macOS
    ```
-3. Add the output as a repository secret named **`KEYSTORE_BASE64`**:  
+2. Add the base64 output as a repository secret named **`KEYSTORE_BASE64`**:  
    *GitHub → Repository → Settings → Secrets and variables → Actions → New repository secret*
+
+> **Important:** the CI workflow will refuse to build if `KEYSTORE_BASE64` is
+> not set. This is intentional – without it every build would be signed with a
+> freshly-generated key, making APK updates impossible for users who have
+> already installed an older build.
 
 The workflow will automatically restore this keystore before every build, ensuring
 all APKs share the same signing key and can be installed as updates without

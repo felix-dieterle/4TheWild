@@ -41,19 +41,17 @@ jobs:
 
       - name: Set up consistent signing keystore
         run: |
-          mkdir -p ~/.android
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
-          else
-            keytool -genkeypair -v \
-              -keystore ~/.android/debug.keystore \
-              -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 \
-              -validity 10000 \
-              -storepass android \
-              -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US"
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is not set."
+            echo "::error::A new keystore would be generated for every build, producing APKs signed"
+            echo "::error::with different keys. Android rejects such updates – users would need to"
+            echo "::error::uninstall the app before installing the new APK."
+            echo "::error::Generate a keystore once with scripts/generate-keystore.sh, base64-encode"
+            echo "::error::it, and store the result as the KEYSTORE_BASE64 repository secret."
+            exit 1
           fi
+          mkdir -p ~/.android
+          echo "$KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
