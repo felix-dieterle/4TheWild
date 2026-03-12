@@ -50,6 +50,9 @@ const TERRAIN_COLORS = {
   demanding_trail: '#ef4444', /* mountain/alpine hiking */
 };
 
+/** Fill colour (rgba) for the canvas overlay that marks unreachable grid cells. */
+const UNREACHABLE_OVERLAY_COLOR = 'rgba(80, 80, 80, 0.60)';
+
 /* ── Road type noise weights (higher = louder) ──────────────────────
  * These are the BASE weights for each highway type, reflecting typical
  * traffic volume and road importance.  They are multiplied at runtime
@@ -231,20 +234,103 @@ const DEFAULT_LANES = {
 
 /* Road type groups shown in the sidebar (label → list of highway values) */
 const WEIGHT_UI_GROUPS = [
-  { label: '🛣 Motorway',    keys: ['motorway', 'motorway_link'],   default: 10 },
-  { label: '🛤 Trunk',       keys: ['trunk', 'trunk_link'],          default: 8  },
-  { label: '🚗 Primary',     keys: ['primary', 'primary_link'],      default: 5  },
-  { label: '🚙 Secondary',   keys: ['secondary', 'secondary_link'],  default: 3  },
-  { label: '🛣 Tertiary',    keys: ['tertiary', 'tertiary_link'],    default: 2  },
-  { label: '🏘 Residential', keys: ['residential', 'living_street'], default: 1.5},
-  { label: '🌲 Track/Path',  keys: ['track', 'path', 'footway', 'cycleway', 'pedestrian', 'steps'], default: 0.2 },
+  { label: '🛣 Motorway',    keys: ['motorway', 'motorway_link'],   default: 10,
+    info: 'High-speed motorways (Autobahn/highway): multi-lane divided roads with restricted access. Very high traffic volume and noise levels.' },
+  { label: '🛤 Trunk',       keys: ['trunk', 'trunk_link'],          default: 8,
+    info: 'Trunk roads: important arterial roads, often dual carriageways with fast traffic. Lower tier than motorways but still high noise.' },
+  { label: '🚗 Primary',     keys: ['primary', 'primary_link'],      default: 5,
+    info: 'Primary roads: major roads linking cities and towns. Moderate to high traffic volume.' },
+  { label: '🚙 Secondary',   keys: ['secondary', 'secondary_link'],  default: 3,
+    info: 'Secondary roads: regional roads connecting towns and larger villages. Medium traffic.' },
+  { label: '🛣 Tertiary',    keys: ['tertiary', 'tertiary_link'],    default: 2,
+    info: 'Tertiary roads: local roads connecting smaller settlements and villages. Lower traffic.' },
+  { label: '🏘 Residential', keys: ['residential', 'living_street'], default: 1.5,
+    info: 'Residential roads & living streets (Spielstraße): roads in built-up areas with low speed limits. Living streets give pedestrians priority.' },
+  { label: '🌲 Track/Path',  keys: ['track', 'path', 'footway', 'cycleway', 'pedestrian', 'steps'], default: 0.2,
+    info: 'Unpaved tracks, hiking paths, cycleways, footways, pedestrian zones and steps. Mainly used for walking, cycling and outdoor activities. Very low noise.' },
 ];
 
 /* Railway type groups shown in the sidebar (label → list of railway values) */
 const RAILWAY_UI_GROUPS = [
-  { label: '🚆 Heavy Rail',  keys: ['rail', 'narrow_gauge'],                  default: 8 },
-  { label: '🚊 Light Rail',  keys: ['light_rail', 'subway', 'monorail'],      default: 4 },
-  { label: '🚋 Tram',        keys: ['tram', 'preserved'],                     default: 3 },
+  { label: '🚆 Heavy Rail',  keys: ['rail', 'narrow_gauge'],                  default: 8,
+    info: 'Main railway lines (intercity, freight, regional trains). High speed and significant noise. Also includes narrow-gauge regional railways.' },
+  { label: '🚊 Light Rail',  keys: ['light_rail', 'subway', 'monorail'],      default: 4,
+    info: 'Urban rail: light rail (Stadtbahn), underground/subway (U-Bahn) and elevated monorail lines. Medium speed, lower noise than heavy rail.' },
+  { label: '🚋 Tram',        keys: ['tram', 'preserved'],                     default: 3,
+    info: 'Street-running trams (Straßenbahn) sharing road space with other traffic. Also includes heritage/museum railway lines.' },
+];
+
+/* ── Transportation modes for reachability analysis ─────────────── *
+ * Each mode defines which OSM highway values are accessible, whether  *
+ * demanding terrain paths (sac_scale) count as reachable, and whether *
+ * waterways should be fetched (for kayaking).                          *
+ * ──────────────────────────────────────────────────────────────────── */
+const REACHABILITY_DISTANCE_M = 200; /* metres from nearest accessible route */
+
+const TRANSPORT_MODES = [
+  {
+    id: 'car',
+    label: '🚗 Auto (Car)',
+    icon:  '🚗',
+    description: 'Reachable by car: motorways, main roads and service roads only.',
+    accessibleHighways: new Set([
+      'motorway', 'motorway_link', 'trunk', 'trunk_link',
+      'primary', 'primary_link', 'secondary', 'secondary_link',
+      'tertiary', 'tertiary_link', 'residential', 'living_street',
+      'unclassified', 'service', 'track',
+    ]),
+    needsWaterways:    false,
+    includeTerrainPaths: false,
+  },
+  {
+    id: 'foot',
+    label: '🚶 Zu Fuß (On foot)',
+    icon:  '🚶',
+    description: 'Reachable on foot: roads with footways or roadsides, plus walking paths, footways and steps.',
+    accessibleHighways: new Set([
+      'primary', 'primary_link', 'secondary', 'secondary_link',
+      'tertiary', 'tertiary_link', 'residential', 'living_street',
+      'unclassified', 'service', 'track', 'path', 'footway',
+      'cycleway', 'pedestrian', 'steps',
+    ]),
+    needsWaterways:    false,
+    includeTerrainPaths: false,
+  },
+  {
+    id: 'climbing',
+    label: '🧗 Klettern (Climbing)',
+    icon:  '🧗',
+    description: 'Reachable by climbing: all walking paths plus demanding rock-climbing routes and difficult terrain.',
+    accessibleHighways: new Set([
+      'primary', 'secondary', 'tertiary', 'residential', 'living_street',
+      'unclassified', 'service', 'track', 'path', 'footway',
+      'cycleway', 'pedestrian', 'steps',
+    ]),
+    needsWaterways:    false,
+    includeTerrainPaths: true,
+  },
+  {
+    id: 'mountaineering',
+    label: '⛰ Bergsteigen (Mountaineering)',
+    icon:  '⛰',
+    description: 'Reachable by alpine mountaineering: all paths including extreme high-alpine terrain and remote routes.',
+    accessibleHighways: new Set([
+      'primary', 'secondary', 'tertiary', 'residential', 'living_street',
+      'unclassified', 'service', 'track', 'path', 'footway',
+      'cycleway', 'pedestrian', 'steps',
+    ]),
+    needsWaterways:    false,
+    includeTerrainPaths: true,
+  },
+  {
+    id: 'kayak',
+    label: '🛶 Kanu fahren (Kayaking)',
+    icon:  '🛶',
+    description: 'Reachable by canoe/kayak: navigable waterways such as rivers, streams and canals.',
+    accessibleHighways: new Set(),
+    needsWaterways:    true,
+    includeTerrainPaths: false,
+  },
 ];
 
 /* ── Built-in noise weight profiles ───────────────────────────────── *
@@ -302,6 +388,10 @@ let heatLayer       = null;
 let quietMarkers    = [];
 let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
+/** Set of selected transport mode IDs (empty = no reachability filtering). */
+let selectedTransportModes = new Set();
+/** Canvas imageOverlay for greying out unreachable grid cells. */
+let unreachableOverlay = null;
 /** In-memory log of HTTP/API errors recorded during the session. */
 const errorLog      = [];
 let locationMarker  = null; /* current-position marker */
@@ -1299,6 +1389,28 @@ function setCachedRailways(bounds, ways) {
   catch { /* quota exceeded */ }
 }
 
+/* ── Waterway cache (localStorage) ──────────────────────────────── */
+const WATERWAY_CACHE_PREFIX = '4w_waterway_';
+
+function waterwayCacheKey(bounds) {
+  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
+  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
+  return `${WATERWAY_CACHE_PREFIX}${s},${w},${n},${e}`;
+}
+function getCachedWaterways(bounds) {
+  try {
+    const raw = localStorage.getItem(waterwayCacheKey(bounds));
+    if (!raw) return null;
+    const { ways, cachedAt } = JSON.parse(raw);
+    if (Date.now() - cachedAt > ROAD_CACHE_TTL_MS) { localStorage.removeItem(waterwayCacheKey(bounds)); return null; }
+    return ways;
+  } catch { return null; }
+}
+function setCachedWaterways(bounds, ways) {
+  try { localStorage.setItem(waterwayCacheKey(bounds), JSON.stringify({ ways, cachedAt: Date.now() })); }
+  catch { /* quota exceeded */ }
+}
+
 /**
  * Register the current map view as an anonymous planned trip.
  * Failures are surfaced to the user but do not block other functionality.
@@ -1372,13 +1484,21 @@ showTerrainCb.addEventListener('change', () => {
 const roadSliderElements    = [];  /* { slider, valSpan } per WEIGHT_UI_GROUPS  */
 const railwaySliderElements = [];  /* { slider, valSpan } per RAILWAY_UI_GROUPS */
 
-WEIGHT_UI_GROUPS.forEach(group => {
+/** Helper: build a weight-row with an optional ℹ info button. */
+function buildWeightRow(group, onInput) {
+  const container = document.createElement('div');
+  container.className = 'weight-group';
+
   const row = document.createElement('div');
   row.className = 'weight-row';
 
   const lbl = document.createElement('label');
-  lbl.textContent = group.label;
   lbl.title = group.keys.join(', ');
+
+  const labelText = document.createElement('span');
+  labelText.className = 'weight-label-text';
+  labelText.textContent = group.label;
+  lbl.appendChild(labelText);
 
   const slider = document.createElement('input');
   slider.type  = 'range';
@@ -1394,47 +1514,54 @@ WEIGHT_UI_GROUPS.forEach(group => {
   slider.addEventListener('input', () => {
     const v = parseFloat(slider.value);
     valSpan.textContent = v;
-    group.keys.forEach(k => { roadWeights[k] = v; });
+    onInput(v);
   });
 
   row.appendChild(lbl);
   row.appendChild(slider);
   row.appendChild(valSpan);
-  weightControls.appendChild(row);
+
+  if (group.info) {
+    const infoBtn = document.createElement('button');
+    infoBtn.type      = 'button';
+    infoBtn.className = 'info-btn';
+    infoBtn.textContent = 'ℹ';
+    infoBtn.setAttribute('aria-label', `Info: ${group.label}`);
+
+    const infoBox = document.createElement('div');
+    infoBox.className = 'weight-info-box hidden';
+    infoBox.textContent = group.info;
+
+    infoBtn.addEventListener('click', e => {
+      e.preventDefault();
+      infoBox.classList.toggle('hidden');
+    });
+
+    row.appendChild(infoBtn);
+    container.appendChild(row);
+    container.appendChild(infoBox);
+  } else {
+    container.appendChild(row);
+  }
+
+  return { container, slider, valSpan };
+}
+
+WEIGHT_UI_GROUPS.forEach(group => {
+  const { container, slider, valSpan } = buildWeightRow(group, v => {
+    group.keys.forEach(k => { roadWeights[k] = v; });
+  });
+  weightControls.appendChild(container);
   roadSliderElements.push({ slider, valSpan });
 });
 
 /* ── Build railway weight sliders ────────────────────────────────── */
 const railwayWeightControls = document.getElementById('railwayWeightControls');
 RAILWAY_UI_GROUPS.forEach(group => {
-  const row = document.createElement('div');
-  row.className = 'weight-row';
-
-  const lbl = document.createElement('label');
-  lbl.textContent = group.label;
-  lbl.title = group.keys.join(', ');
-
-  const slider = document.createElement('input');
-  slider.type  = 'range';
-  slider.min   = 0;
-  slider.max   = 10;
-  slider.step  = 0.1;
-  slider.value = group.default;
-
-  const valSpan = document.createElement('span');
-  valSpan.className = 'wval';
-  valSpan.textContent = group.default;
-
-  slider.addEventListener('input', () => {
-    const v = parseFloat(slider.value);
-    valSpan.textContent = v;
+  const { container, slider, valSpan } = buildWeightRow(group, v => {
     group.keys.forEach(k => { railwayWeights[k] = v; });
   });
-
-  row.appendChild(lbl);
-  row.appendChild(slider);
-  row.appendChild(valSpan);
-  railwayWeightControls.appendChild(row);
+  railwayWeightControls.appendChild(container);
   railwaySliderElements.push({ slider, valSpan });
 });
 
@@ -1632,7 +1759,55 @@ function buildProfileUI() {
 
 buildProfileUI();
 
-/* ── Heatmap display controls ────────────────────────────────────── */
+/* ── Transport mode selector ─────────────────────────────────────── */
+
+/**
+ * Inject transport-mode checkboxes into the #transportModes container.
+ * Checking/unchecking updates the `selectedTransportModes` Set.
+ */
+function buildTransportUI() {
+  const container = document.getElementById('transportModes');
+  if (!container) return;
+
+  TRANSPORT_MODES.forEach(mode => {
+    const item = document.createElement('label');
+    item.className = 'transport-mode-item';
+    item.title = mode.description;
+
+    const cb = document.createElement('input');
+    cb.type  = 'checkbox';
+    cb.value = mode.id;
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        selectedTransportModes.add(mode.id);
+      } else {
+        selectedTransportModes.delete(mode.id);
+      }
+      /* Clear the unreachable overlay immediately when modes change so it
+       * does not stay stale until the next analysis run.               */
+      if (unreachableOverlay) {
+        map.removeLayer(unreachableOverlay);
+        unreachableOverlay = null;
+      }
+    });
+
+    const icon = document.createElement('span');
+    icon.className = 'transport-mode-icon';
+    icon.textContent = mode.icon;  /* explicit icon property, no fragile string-split */
+
+    const text = document.createElement('span');
+    text.className = 'transport-mode-label';
+    /* Strip the leading icon character + space to get just the name */
+    text.textContent = mode.label.replace(/^\S+\s/, '');
+
+    item.appendChild(cb);
+    item.appendChild(icon);
+    item.appendChild(text);
+    container.appendChild(item);
+  });
+}
+
+buildTransportUI();
 opacitySlider.addEventListener('input', () => {
   opacityVal.textContent = Math.round(opacitySlider.value * 100) + '%';
   if (heatLayer) heatLayer.setOptions({ opacity: parseFloat(opacitySlider.value) });
@@ -1663,12 +1838,24 @@ async function runAnalysis() {
     const useVeg      = vegDampeningCb.checked;
     const useTerrain  = showTerrainCb.checked;
     const useRailways = useRailwaysCb.checked;
-    const [ways, plannedTrips, vegetation, terrainWays, railwayWays] = await Promise.all([
+
+    /* Determine extra data needed for reachability filtering */
+    const needsWaterways = [...selectedTransportModes].some(id => {
+      const m = TRANSPORT_MODES.find(m => m.id === id);
+      return m?.needsWaterways;
+    });
+    const needsTerrainForReach = [...selectedTransportModes].some(id => {
+      const m = TRANSPORT_MODES.find(m => m.id === id);
+      return m?.includeTerrainPaths;
+    });
+
+    const [ways, plannedTrips, vegetation, terrainWays, railwayWays, waterwayWays] = await Promise.all([
       fetchRoads(bounds),
       fetchPlannedTrips(bounds),
-      useVeg      ? fetchVegetation(bounds) : Promise.resolve([]),
-      useTerrain  ? fetchTerrain(bounds)    : Promise.resolve([]),
-      useRailways ? fetchRailways(bounds)   : Promise.resolve([]),
+      useVeg                              ? fetchVegetation(bounds) : Promise.resolve([]),
+      (useTerrain || needsTerrainForReach)? fetchTerrain(bounds)    : Promise.resolve([]),
+      useRailways                         ? fetchRailways(bounds)   : Promise.resolve([]),
+      needsWaterways                      ? fetchWaterways(bounds)  : Promise.resolve([]),
     ]);
 
     if (!ways.length) {
@@ -1691,12 +1878,15 @@ async function runAnalysis() {
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
-    const { heatPoints, quietestPoints } = computeHeatmap(ways, bounds, plannedTrips, vegetation, railwayWays);
+    const { heatPoints, quietestPoints, unreachablePoints } = computeHeatmap(
+      ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays,
+    );
 
     renderHeatmap(heatPoints);
     renderTripRects(plannedTrips);
     renderVegetationLayer(useVeg ? vegetation : []);
     renderTerrainLayer(useTerrain ? terrainWays : []);
+    renderUnreachableOverlay(unreachablePoints, bounds);
     if (useTerrain && terrainWays.length) {
       terrainLegendEl.classList.remove('hidden');
     } else {
@@ -1704,11 +1894,15 @@ async function runAnalysis() {
     }
     renderResults(quietestPoints);
 
+    const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
+      ? ` ${unreachablePoints.length} area(s) greyed out (unreachable).`
+      : '';
     showStatus(
       `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
       (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
       (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : '') +
-      (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : ''),
+      (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : '') +
+      reachNote,
       'success'
     );
   } catch (err) {
@@ -1881,7 +2075,34 @@ async function fetchRailways(bounds) {
   }
 }
 
-/* ── Noise computation ───────────────────────────────────────────── */
+/**
+ * Fetch navigable waterway ways (rivers, streams, canals, etc.) for the
+ * given bounds via Overpass, caching the result in localStorage.
+ * Used for kayaking/canoeing reachability analysis.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} Overpass way elements
+ */
+async function fetchWaterways(bounds) {
+  const cached = getCachedWaterways(bounds);
+  if (cached) return cached;
+
+  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
+  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
+  const query =
+    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
+    `way["waterway"~"^(river|stream|canal|drain|ditch)$"](${bbox});` +
+    `out geom;`;
+  try {
+    const elements = await fetchFromOverpass(query);
+    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
+    setCachedWaterways(bounds, ways);
+    return ways;
+  } catch (err) {
+    console.warn('Waterway fetch failed:', err.message);
+    return [];
+  }
+}
 const GRID_SIZE = 50; /* points per axis → 50×50 = 2 500 sample points */
 const OVERPASS_TIMEOUT_S   = 25;   /* server-side timeout in seconds */
 const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort with grace period */
@@ -2084,7 +2305,7 @@ function dynamicRailwayNoiseFactor(railway, tags) {
   return Math.min(MAX_DYNAMIC_NOISE_FACTOR, Math.max(MIN_DYNAMIC_NOISE_FACTOR, factor));
 }
 
-function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = []) {
+function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = [], waterwayWays = [], reachTerrainWays = []) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
@@ -2148,11 +2369,82 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
   lastNoiseCtx = { segments, mPerLat, mPerLng, vegetation, plannedTrips };
 
   if (!segments.length) {
-    return { heatPoints: [], quietestPoints: [] };
+    return { heatPoints: [], quietestPoints: [], unreachablePoints: [] };
+  }
+
+  /* ── Build reachability segments ────────────────────────────────── *
+   * Collect all way segments that are accessible given the currently   *
+   * selected transport modes.  If no modes are selected, reachability  *
+   * filtering is disabled and all grid points are treated as reachable. *
+   * ──────────────────────────────────────────────────────────────────── */
+  const filterByReachability = selectedTransportModes.size > 0;
+  const reachSegments = [];
+
+  if (filterByReachability) {
+    const accessibleHighways = new Set();
+    let includeTerrainPaths = false;
+    let includeWaterways    = false;
+
+    for (const modeId of selectedTransportModes) {
+      const mode = TRANSPORT_MODES.find(m => m.id === modeId);
+      if (!mode) continue;
+      mode.accessibleHighways.forEach(h => accessibleHighways.add(h));
+      if (mode.includeTerrainPaths) includeTerrainPaths = true;
+      if (mode.needsWaterways)      includeWaterways    = true;
+    }
+
+    /* Road segments accessible by the selected modes */
+    for (const way of ways) {
+      const highway = way.tags && way.tags.highway;
+      if (!highway || !accessibleHighways.has(highway)) continue;
+      const geom = way.geometry;
+      if (!geom || geom.length < 2) continue;
+      for (let i = 0; i < geom.length - 1; i++) {
+        reachSegments.push({
+          ax: geom[i].lon   * mPerLng,
+          ay: geom[i].lat   * mPerLat,
+          bx: geom[i+1].lon * mPerLng,
+          by: geom[i+1].lat * mPerLat,
+        });
+      }
+    }
+
+    /* Terrain paths for climbing / mountaineering */
+    if (includeTerrainPaths) {
+      for (const way of reachTerrainWays) {
+        const geom = way.geometry;
+        if (!geom || geom.length < 2) continue;
+        for (let i = 0; i < geom.length - 1; i++) {
+          reachSegments.push({
+            ax: geom[i].lon   * mPerLng,
+            ay: geom[i].lat   * mPerLat,
+            bx: geom[i+1].lon * mPerLng,
+            by: geom[i+1].lat * mPerLat,
+          });
+        }
+      }
+    }
+
+    /* Waterways for kayaking / canoeing */
+    if (includeWaterways) {
+      for (const way of waterwayWays) {
+        const geom = way.geometry;
+        if (!geom || geom.length < 2) continue;
+        for (let i = 0; i < geom.length - 1; i++) {
+          reachSegments.push({
+            ax: geom[i].lon   * mPerLng,
+            ay: geom[i].lat   * mPerLat,
+            bx: geom[i+1].lon * mPerLng,
+            by: geom[i+1].lat * mPerLat,
+          });
+        }
+      }
+    }
   }
 
   /* Score every grid point */
-  const gridScores = [];
+  const gridScores      = [];
+  const unreachablePoints = [];
   let maxNoise = 0;
 
   for (let i = 0; i <= GRID_SIZE; i++) {
@@ -2161,6 +2453,24 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
       const lng = lngMin + j * lngStep;
       const px  = lng * mPerLng;
       const py  = lat * mPerLat;
+
+      /* ── Reachability check ─────────────────────────────────────── *
+       * Skip (grey out) this point if the nearest accessible route is  *
+       * further than REACHABILITY_DISTANCE_M metres away.              *
+       * ──────────────────────────────────────────────────────────────── */
+      if (filterByReachability) {
+        let reachable = false;
+        for (const seg of reachSegments) {
+          if (ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by) <= REACHABILITY_DISTANCE_M) {
+            reachable = true;
+            break;
+          }
+        }
+        if (!reachable) {
+          unreachablePoints.push({ lat, lng });
+          continue;
+        }
+      }
 
       let noiseScore = 0;
       for (const seg of segments) {
@@ -2200,14 +2510,14 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
 
   /* Normalise 0-1 for Leaflet.heat */
   const heatPoints = gridScores.map(({ lat, lng, noiseScore }) => [
-    lat, lng, noiseScore / maxNoise,
+    lat, lng, maxNoise > 0 ? noiseScore / maxNoise : 0,
   ]);
 
-  /* Top 5 quietest points (lowest noise score) */
+  /* Top 5 quietest points (lowest noise score, reachable only) */
   const sorted = [...gridScores].sort((a, b) => a.noiseScore - b.noiseScore);
   const quietestPoints = sorted.slice(0, 5);
 
-  return { heatPoints, quietestPoints, maxNoise };
+  return { heatPoints, quietestPoints, maxNoise, unreachablePoints };
 }
 
 /**
@@ -2477,7 +2787,59 @@ function renderTerrainLayer(ways) {
   terrainLayer.addTo(map);
 }
 
-/* ── Helpers ─────────────────────────────────────────────────────── */
+/* ── Unreachable-area overlay ────────────────────────────────────── */
+
+/**
+ * Render a semi-transparent grey canvas overlay on the map for all grid
+ * points that were outside the reachability threshold during the last
+ * analysis run.  Removes any previously rendered overlay first.
+ * @param {Array<{lat:number,lng:number}>} unreachablePoints
+ * @param {L.LatLngBounds}                 bounds
+ */
+function renderUnreachableOverlay(unreachablePoints, bounds) {
+  if (unreachableOverlay) {
+    map.removeLayer(unreachableOverlay);
+    unreachableOverlay = null;
+  }
+  if (!unreachablePoints || !unreachablePoints.length) return;
+
+  const W = 512, H = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  const latMin = bounds.getSouth();
+  const latMax = bounds.getNorth();
+  const lngMin = bounds.getWest();
+  const lngMax = bounds.getEast();
+
+  /* Cell size in canvas pixels (one extra cell to cover rounding gaps) */
+  const cellW = W / GRID_SIZE + 1;
+  const cellH = H / GRID_SIZE + 1;
+
+  ctx.fillStyle = UNREACHABLE_OVERLAY_COLOR;
+
+  for (const { lat, lng } of unreachablePoints) {
+    const x = ((lng - lngMin) / (lngMax - lngMin)) * W;
+    const y = ((latMax - lat) / (latMax - latMin)) * H;
+    ctx.fillRect(x - cellW / 2, y - cellH / 2, cellW, cellH);
+  }
+
+  /* Use a dedicated Leaflet pane so the overlay sits above the heatmap
+   * but below markers and popups.                                       */
+  if (!map.getPane('unreachablePane')) {
+    map.createPane('unreachablePane');
+    map.getPane('unreachablePane').style.zIndex = '450';
+    map.getPane('unreachablePane').style.pointerEvents = 'none';
+  }
+
+  unreachableOverlay = L.imageOverlay(canvas.toDataURL(), bounds, {
+    pane:        'unreachablePane',
+    interactive: false,
+    opacity:     1,
+  }).addTo(map);
+}
 function showStatus(msg, type = 'info') {
   statusEl.textContent = msg;
   statusEl.className = `status ${type}`;

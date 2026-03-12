@@ -148,6 +148,89 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
 /* ── Weight controls ────────────────────────────────────────────── */
 #weightControls { display: flex; flex-direction: column; gap: 6px; }
 
+/* Wrapper around each weight-row + optional info box */
+.weight-group { display: flex; flex-direction: column; gap: 2px; }
+
+/* Info button next to each road/railway type label */
+.info-btn {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 0.65rem;
+  line-height: 1;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.info-btn:hover { color: var(--accent2); border-color: var(--accent2); filter: none; }
+
+/* Expandable info text shown when ℹ is clicked */
+.weight-info-box {
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--accent2);
+  border-radius: 4px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+/* Label text span inside a weight-row label */
+.weight-label-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── Transport mode grid ─────────────────────────────────────────── */
+.transport-modes-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.transport-mode-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s;
+  user-select: none;
+}
+.transport-mode-item:hover { border-color: var(--accent2); }
+.transport-mode-item input[type=checkbox] {
+  accent-color: var(--accent2);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.transport-mode-item input[type=checkbox]:checked + .transport-mode-icon {
+  filter: none;
+}
+.transport-mode-item:has(input:checked) {
+  border-color: var(--accent2);
+  color: var(--accent2);
+}
+.transport-mode-icon { font-size: 1rem; flex-shrink: 0; }
+.transport-mode-label {
+  font-size: 0.72rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Profile selector ───────────────────────────────────────────── */
 .profile-row {
   display: flex;
@@ -195,13 +278,14 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
   gap: 6px;
 }
 .weight-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   font-size: 0.78rem;
   color: var(--text);
   width: 110px;
   flex-shrink: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: 0;
 }
 .weight-row input[type=range] {
   flex: 1;
