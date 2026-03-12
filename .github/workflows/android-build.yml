@@ -25,6 +25,11 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Set version code
+        run: |
+          sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i "s/const APP_BUILD *= *[0-9]\+/const APP_BUILD   = ${{ github.run_number }}/" app.js
+
       - name: Copy web assets into Android project
         run: |
           mkdir -p android/app/src/main/assets/www
@@ -51,11 +56,6 @@ jobs:
           fi
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-
-      - name: Set version code
-        run: |
-          sed -i "s/versionCode [0-9]\+/versionCode ${{ github.run_number }}/" android/app/build.gradle
-          sed -i "s/const APP_BUILD *= *[0-9]\+/const APP_BUILD   = ${{ github.run_number }}/" app.js
 
       - name: Build debug APK
         run: |
