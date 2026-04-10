@@ -135,14 +135,30 @@ shared-hosting environments where Node.js is unavailable.
 | `apps/wild/api.php` | Main router – handles all `/api/*` requests |
 | `apps/wild/config.php` | PDO connection factory (reads DB credentials from env vars) |
 | `apps/wild/.htaccess` | Apache mod_rewrite rules to route `/api/*` → `api.php` |
-| `apps/wild/db/schema.sql` | MySQL schema (`road_cache` + `trips` tables) |
+| `apps/wild/db/schema.sql` | MySQL schema (`roads` + `road_cache` + `trips` tables) |
+| `apps/wild/db/import_osm.php` | CLI script – imports a GeoJSONSeq file into the `roads` table |
 
 ### Database schema
 
 ```
+roads        osm_id BIGINT PK, highway/railway VARCHAR(32), maxspeed VARCHAR(32),
+             lanes TINYINT, name VARCHAR(255), geometry LINESTRING (SPATIAL INDEX)
 road_cache   cache_key PK, ways_json LONGTEXT, cached_at BIGINT
 trips        id CHAR(36) PK, south/west/north/east DOUBLE, created_at BIGINT
 ```
+
+### Road data lookup strategy
+
+The `/api/roads` endpoint uses a three-tier strategy:
+
+| Tier | Source | When used |
+|------|--------|-----------|
+| 1 | `roads` table | Pre-imported OSM data present for the bbox |
+| 2 | `road_cache` table | No import data; returns cached Overpass response (24 h TTL) |
+| 3 | Overpass API (live) | No cached data; fetches and caches the result |
+
+Populate the `roads` table once via `import_osm.php` (see below) to serve all
+requests from your own database without any dependency on the Overpass API.
 
 ### Setup
 
@@ -193,7 +209,7 @@ sudo systemctl reload apache2
 **4. Test the endpoints**
 
 ```bash
-# Road cache (first call hits Overpass; subsequent calls return cached data)
+# Road data (served from `roads` table if populated, otherwise Overpass cache/live)
 curl "http://example.com/api/roads?south=48.1&west=11.5&north=48.2&east=11.6"
 
 # Submit an anonymous trip plan
@@ -204,6 +220,77 @@ curl -X POST http://example.com/api/trips \
 # Query overlapping trip plans
 curl "http://example.com/api/trips?south=48.1&west=11.5&north=48.2&east=11.6"
 ```
+
+### Importing OSM road data (optional but recommended)
+
+Pre-loading road data from an OpenStreetMap export eliminates all dependency on
+the Overpass API and dramatically reduces response times for high-traffic
+deployments.
+
+**OSM data licence**
+
+OpenStreetMap data is © OpenStreetMap contributors, licensed under the
+[Open Database Licence (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/).
+You **must** display the attribution `© OpenStreetMap contributors` visibly in
+the application UI.  Commercial use is permitted under the same licence terms,
+provided you do not redistribute a derived database without sharing it under
+ODbL as well.
+
+**Install osmium-tool**
+
+```bash
+apt install osmium-tool          # Debian/Ubuntu
+brew install osmium-tool         # macOS
+```
+
+**Step 1 – Download a regional extract**
+
+```bash
+# Germany (~4 GB PBF)
+wget https://download.geofabrik.de/europe/germany-latest.osm.pbf
+```
+
+Smaller regional extracts are available at
+<https://download.geofabrik.de/europe/germany.html> (individual states).
+
+**Step 2 – Filter to highway/railway ways only**
+
+```bash
+osmium tags-filter germany-latest.osm.pbf w/highway w/railway \
+  --add-referenced-nodes -o germany-roads.osm.pbf
+```
+
+The filtered file is roughly 200–400 MB.
+
+**Step 3 – Export as line-delimited GeoJSON with resolved geometry**
+
+```bash
+osmium export germany-roads.osm.pbf \
+  --geometry-types=linestring \
+  -f geojsonseq -o germany-roads.geojsonseq
+```
+
+**Step 4 – Import into the database**
+
+```bash
+export DB_HOST=localhost DB_PORT=3306 DB_NAME=4thewild \
+       DB_USER=your_user DB_PASS=your_pass
+
+# First import (or incremental update – existing rows are replaced)
+php apps/wild/db/import_osm.php germany-roads.geojsonseq
+
+# Full re-import (removes old ways that no longer exist in the dump)
+php apps/wild/db/import_osm.php --truncate germany-roads.geojsonseq
+```
+
+A full Germany import inserts roughly 8–12 million rows and takes 15–30 minutes
+depending on hardware.  Estimated storage: 2–5 GB.
+
+**Keeping data up to date**
+
+Geofabrik publishes updated regional extracts daily.  Automate the pipeline with
+a cron job or a CI schedule; use `--truncate` for a clean full refresh or omit it
+for an incremental update that only replaces changed ways.
 
 ### API reference
 

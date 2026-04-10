@@ -11,8 +11,16 @@
  *   GET  /api/trips?south=&west=&north=&east=   → 200 { count, trips[] }
  *   POST /api/trips                             { south, west, north, east } → 201 { id }
  *
- * Road data is cached in the `road_cache` table for ROAD_CACHE_TTL_MS (24 h),
- * keyed by a tile-quantised bounding box so nearby requests share the same row.
+ * Road data lookup strategy (three tiers):
+ *   1. `roads` table – pre-imported OSM geometries (spatial bbox query, no TTL).
+ *      Populated via apps/wild/db/import_osm.php.  When data is present for the
+ *      requested area this tier is used exclusively; Overpass is never called.
+ *   2. `road_cache` table – Overpass API response cache (24 h TTL).
+ *      Used as fallback when the `roads` table has no data for the area.
+ *   3. Overpass API – live fetch on cache miss (disabled by default).
+ *
+ * Data licence: OpenStreetMap contributors, ODbL 1.0.
+ * The application UI must display the attribution "© OpenStreetMap contributors".
  *
  * Trip plans expire after TRIP_TTL_MS (24 h) and are pruned lazily on every
  * request – no scheduler or cron job is required.
@@ -157,13 +165,53 @@ if ($method === 'GET' && $path === '/api/roads') {
     }
 
     $pdo = db_connect();
+
+    /* ── Tier 1: pre-imported OSM roads table (spatial bbox query) ── */
+    /* Construct a WKT bounding-box polygon: X=longitude, Y=latitude  */
+    $bboxWkt = "POLYGON(({$w} {$s}, {$e} {$s}, {$e} {$n}, {$w} {$n}, {$w} {$s}))";
+    $stmt = $pdo->prepare(
+        'SELECT osm_id, highway, railway, maxspeed, lanes, name,
+                ST_AsGeoJSON(geometry) AS geojson
+         FROM roads
+         WHERE MBRIntersects(geometry, ST_GeomFromText(:bbox))'
+    );
+    $stmt->execute([':bbox' => $bboxWkt]);
+    $roadRows = $stmt->fetchAll();
+
+    if ($roadRows) {
+        /* Convert DB rows to Overpass-compatible way elements so the
+         * frontend can consume them without modification. */
+        $ways = array_map(static function (array $row): array {
+            $coords = json_decode($row['geojson'], true)['coordinates'] ?? [];
+            /* GeoJSON coordinates are [lon, lat]; frontend expects {lat, lon} */
+            $geometry = array_map(
+                static fn(array $c): array => ['lat' => $c[1], 'lon' => $c[0]],
+                $coords
+            );
+            $tags = [];
+            if ($row['highway']  !== null) $tags['highway']  = $row['highway'];
+            if ($row['railway']  !== null) $tags['railway']  = $row['railway'];
+            if ($row['maxspeed'] !== null) $tags['maxspeed'] = $row['maxspeed'];
+            if ($row['lanes']    !== null) $tags['lanes']    = (string) $row['lanes'];
+            if ($row['name']     !== null) $tags['name']     = $row['name'];
+            return [
+                'type'     => 'way',
+                'id'       => (int) $row['osm_id'],
+                'tags'     => $tags,
+                'geometry' => $geometry,
+            ];
+        }, $roadRows);
+
+        json_response(200, ['ways' => $ways, 'cached' => true], ['X-Cache' => 'DB']);
+    }
+
+    /* ── Tier 2: road_cache table (Overpass response cache, 24 h TTL) */
     prune_expired_road_cache($pdo);
 
     $tile = tile_for_bbox((float) $s, (float) $w, (float) $n, (float) $e);
     $key  = $tile['key'];
     $now  = (int) (microtime(true) * 1000);
 
-    /* Cache lookup */
     $stmt = $pdo->prepare(
         'SELECT ways_json, cached_at FROM road_cache WHERE cache_key = :key LIMIT 1'
     );
@@ -175,7 +223,7 @@ if ($method === 'GET' && $path === '/api/roads') {
         json_response(200, ['ways' => $ways, 'cached' => true], ['X-Cache' => 'HIT']);
     }
 
-    /* Cache miss – fetch from Overpass */
+    /* ── Tier 3: live Overpass fetch on cache miss ─────────────────── */
     try {
         $ways = fetch_overpass_roads(
             $tile['ts'], $tile['tw'], $tile['tn'], $tile['te']
