@@ -42,29 +42,6 @@ const TRIP_TTL_MS = 24 * 60 * 60 * 1000;
 /** Road cache expires after 24 hours (milliseconds). */
 const ROAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** Overpass query timeout sent inside the OverpassQL query (seconds). */
-const OVERPASS_QUERY_TIMEOUT_S = 25;
-
-/** Socket-level timeout (seconds) – network latency on top of query processing. */
-const OVERPASS_TIMEOUT_S = 30;
-
-/** Number of full passes through all mirrors before giving up. */
-const OVERPASS_MAX_PASSES = 2;
-
-/** Delay (seconds) before the second pass – lets overloaded mirrors recover. */
-const OVERPASS_RETRY_DELAY_S = 3;
-
-/**
- * Public Overpass API mirrors tried in order.
- * On 504 / timeout the next mirror is tried automatically.
- */
-const OVERPASS_ENDPOINTS = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://lz4.overpass-api.de/api/interpreter',
-    'https://overpass.openstreetmap.fr/api/interpreter',
-];
-
 /* ── CORS ────────────────────────────────────────────────────────── */
 
 header('Access-Control-Allow-Origin: *');
@@ -138,88 +115,14 @@ function prune_expired_road_cache(PDO $pdo): void
 }
 
 /**
- * Try to fetch road ways from a single Overpass endpoint.
- * Returns the decoded elements array on success, or throws on failure.
+ * Overpass API calls are disabled.
+ * Always throws immediately to prevent real external requests.
  *
- * @return array<int, mixed>
  * @throws RuntimeException
- */
-function fetch_overpass_once(string $url, string $query): array
-{
-    $context = stream_context_create([
-        'http' => [
-            'method'        => 'POST',
-            'header'        => "Content-Type: application/x-www-form-urlencoded\r\n",
-            'content'       => 'data=' . rawurlencode($query),
-            'timeout'       => OVERPASS_TIMEOUT_S,
-            'ignore_errors' => true,
-        ],
-        'ssl'  => [
-            'verify_peer'      => true,
-            'verify_peer_name' => true,
-        ],
-    ]);
-
-    $raw = @file_get_contents($url, false, $context);
-
-    /* Parse HTTP status from response headers */
-    $status = 200;
-    if (isset($http_response_header) && is_array($http_response_header)) {
-        foreach ($http_response_header as $header) {
-            if (preg_match('#^HTTP/\S+ (\d+)#', $header, $m)) {
-                $status = (int) $m[1];
-            }
-        }
-    }
-
-    if ($raw === false || $status !== 200) {
-        throw new RuntimeException("Overpass returned HTTP {$status}", $status);
-    }
-
-    $data = json_decode($raw, true);
-    if (!is_array($data)) {
-        throw new RuntimeException('Overpass returned invalid JSON');
-    }
-
-    return $data['elements'] ?? [];
-}
-
-/**
- * Fetch road ways from the Overpass API for the given bbox.
- * Tries each mirror in OVERPASS_ENDPOINTS in order, with OVERPASS_MAX_PASSES
- * passes total so transient failures on one mirror are automatically retried.
- *
- * @return array<int, mixed>
- * @throws RuntimeException when all mirrors fail on all passes
  */
 function fetch_overpass_roads(float $s, float $w, float $n, float $e): array
 {
-    $bbox  = "{$s},{$w},{$n},{$e}";
-    $query = '[out:json][timeout:' . OVERPASS_QUERY_TIMEOUT_S . '];'
-           . "way[\"highway\"]({$bbox});out geom;";
-
-    $lastError = null;
-    for ($pass = 0; $pass < OVERPASS_MAX_PASSES; $pass++) {
-        foreach (OVERPASS_ENDPOINTS as $url) {
-            try {
-                return fetch_overpass_once($url, $query);
-            } catch (RuntimeException $e) {
-                $lastError = $e;
-                $retryable = in_array($e->getCode(), [502, 504, 429, 0], true)
-                          || str_contains($e->getMessage(), 'timed out');
-                if (!$retryable) {
-                    throw $e;
-                }
-                error_log("4TheWild: Overpass mirror {$url} failed ({$e->getMessage()}), trying next…");
-            }
-        }
-        /* Pause between passes to give overloaded mirrors time to recover */
-        if ($pass + 1 < OVERPASS_MAX_PASSES) {
-            sleep(OVERPASS_RETRY_DELAY_S * ($pass + 1));
-        }
-    }
-
-    throw $lastError ?? new RuntimeException('All Overpass mirrors failed');
+    throw new RuntimeException('Overpass API calls are disabled');
 }
 
 /* ── Routing ─────────────────────────────────────────────────────── */

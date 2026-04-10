@@ -25,30 +25,11 @@
 'use strict';
 
 const http   = require('http');
-const https  = require('https');
 const crypto = require('crypto');
 
 const PORT             = parseInt(process.env.PORT || '3000', 10);
 const TRIP_TTL_MS      = 24 * 60 * 60 * 1000; /* trips expire after 24 hours */
 const ROAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000; /* road cache expires after 24 hours */
-/** Server-side Overpass query timeout (seconds) – sent inside the OverpassQL query. */
-const OVERPASS_QUERY_TIMEOUT_S = 25;
-/** Socket-level abort timeout (ms) – includes network latency on top of query processing. */
-const OVERPASS_TIMEOUT_MS = (OVERPASS_QUERY_TIMEOUT_S + 5) * 1000;
-/** Number of full passes through all mirrors before giving up. */
-const OVERPASS_MAX_PASSES = 2;
-/** Base delay (ms) before the second pass – gives overloaded mirrors time to recover. */
-const OVERPASS_RETRY_DELAY_MS = 3000;
-/**
- * Public Overpass API mirrors tried in order.  If the primary returns 504 or
- * times out the next mirror is tried automatically.
- */
-const OVERPASS_ENDPOINTS = [
-  { hostname: 'overpass-api.de',              path: '/api/interpreter' },
-  { hostname: 'overpass.kumi.systems',         path: '/api/interpreter' },
-  { hostname: 'lz4.overpass-api.de',           path: '/api/interpreter' },
-  { hostname: 'overpass.openstreetmap.fr',     path: '/api/interpreter' },
-];
 
 /**
  * In-memory trip store.
@@ -99,86 +80,11 @@ function tileForBbox(s, w, n, e) {
 }
 
 /**
- * Attempt a single Overpass request against one endpoint.
- * Resolves with the elements array or rejects with an error that includes the
- * HTTP status code so the caller can decide whether to retry.
- * @param {{ hostname: string, path: string }} endpoint
- * @param {string} body  URL-encoded query body
- * @returns {Promise<Array>}
- */
-function fetchOverpassOnce(endpoint, body) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: endpoint.hostname,
-      path:     endpoint.path,
-      method:   'POST',
-      headers: {
-        'Content-Type':   'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, (incoming) => {
-      const chunks = [];
-      incoming.on('data', chunk => chunks.push(chunk));
-      incoming.on('end', () => {
-        if (incoming.statusCode !== 200) {
-          const err = new Error(`Overpass returned HTTP ${incoming.statusCode}`);
-          err.statusCode = incoming.statusCode;
-          return reject(err);
-        }
-        try {
-          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          resolve(data.elements || []);
-        } catch (parseErr) {
-          reject(parseErr);
-        }
-      });
-    });
-
-    req.setTimeout(OVERPASS_TIMEOUT_MS, () => {
-      req.destroy(new Error('Overpass request timed out'));
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-/**
- * Fetch road ways from the Overpass API for the given bbox.
- * Tries each entry in OVERPASS_ENDPOINTS in order, falling back on 504 or
- * timeout so a single overloaded mirror does not cause a total failure.
- * If every mirror fails on a pass it waits OVERPASS_RETRY_DELAY_MS before a
- * second pass, giving servers a chance to recover.
- * Returns a Promise that resolves with the elements array.
+ * Overpass API calls are disabled.
+ * Always rejects immediately to prevent real external requests.
  */
 async function fetchOverpassRoads(s, w, n, e) {
-  const bbox  = `${s},${w},${n},${e}`;
-  const query = `[out:json][timeout:${OVERPASS_QUERY_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
-  const body  = `data=${encodeURIComponent(query)}`;
-
-  let lastErr;
-  for (let pass = 0; pass < OVERPASS_MAX_PASSES; pass++) {
-    if (pass > 0) {
-      await new Promise(r => setTimeout(r, OVERPASS_RETRY_DELAY_MS * pass));
-    }
-    for (const endpoint of OVERPASS_ENDPOINTS) {
-      try {
-        return await fetchOverpassOnce(endpoint, body);
-      } catch (err) {
-        lastErr = err;
-        /* Only retry on gateway/timeout/network errors – not on 400 Bad Request etc. */
-        const retryable = err.statusCode === 504 || err.statusCode === 502 || err.statusCode === 429 ||
-                          err.message === 'Overpass request timed out' ||
-                          err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' ||
-                          err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED';
-        if (!retryable) throw err;
-        console.warn(`Overpass mirror ${endpoint.hostname} failed (${err.message}), trying next…`);
-      }
-    }
-  }
-  throw lastErr;
+  throw new Error('Overpass API calls are disabled');
 }
 
 function setCorsHeaders(res) {
