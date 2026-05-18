@@ -44,7 +44,11 @@ jobs:
           mkdir -p ~/.android
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+            echo "KEYSTORE_BOOTSTRAP=false" >> $GITHUB_ENV
           else
+            echo "::warning::KEYSTORE_BASE64 secret is not set – generating a one-time bootstrap keystore."
+            echo "::warning::After this build, save the artifact 'keystore-setup' as the KEYSTORE_BASE64"
+            echo "::warning::repository secret so all future APKs share the same signing key."
             keytool -genkeypair -v \
               -keystore ~/.android/debug.keystore \
               -alias androiddebugkey \
@@ -53,9 +57,19 @@ jobs:
               -storepass android \
               -keypass android \
               -dname "CN=Android Debug,O=Android,C=US"
+            base64 ~/.android/debug.keystore | tr -d '\n' > /tmp/KEYSTORE_BASE64.txt
+            echo "KEYSTORE_BOOTSTRAP=true" >> $GITHUB_ENV
           fi
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: Upload bootstrap keystore (first-time setup only)
+        if: env.KEYSTORE_BOOTSTRAP == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: keystore-setup
+          path: /tmp/KEYSTORE_BASE64.txt
+          retention-days: 1
 
       - name: Build debug APK
         run: |
