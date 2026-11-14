@@ -5,16 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self';
-                 script-src 'self' 'unsafe-inline';
+                 script-src 'self' 'unsafe-inline' blob:;
+                 worker-src 'self' blob:;
                  style-src 'self' 'unsafe-inline';
-                 img-src 'self' data: blob: https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de;
-                 connect-src 'self' https://overpass-api.de https://*.tile.openstreetmap.org https://*.tile.openstreetmap.de http://localhost:3000 https://nominatim.openstreetmap.org https://router.project-osrm.org;" />
+                 img-src 'self' data: blob: https://tiles.openfreemap.org https://*.openfreemap.org;
+                 font-src 'self' data:;
+                 connect-src 'self' https://tiles.openfreemap.org https://*.openfreemap.org http://localhost:3000 https://nominatim.openstreetmap.org https://router.project-osrm.org;" />
   <title>4TheWild – Silent Place Finder</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" type="image/svg+xml" href="logo.svg" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
   <meta name="theme-color" content="#0d2010" />
-  <link rel="stylesheet" href="lib/leaflet.css" />
+  <link rel="stylesheet" href="lib/maplibre-gl.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -180,7 +182,9 @@
       </section>
 
       <footer>
-        Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>
+        Map &amp; road data &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors
+        &middot; tiles by <a href="https://openfreemap.org/" target="_blank" rel="noopener">OpenFreeMap</a>
+        &middot; <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">ODbL</a>
       </footer>
     </aside>
 
@@ -190,8 +194,7 @@
   <!-- Mobile sidebar overlay -->
   <div id="sidebarOverlay" class="hidden"></div>
 
-  <script src="lib/leaflet.js"></script>
-  <script src="lib/leaflet-heat.js"></script>
+  <script src="lib/maplibre-gl.js"></script>
   <!-- Version splash shown briefly on startup -->
   <div id="versionSplash" class="hidden" role="status" aria-live="polite">
     <img src="logo.svg" class="splash-logo" alt="4TheWild jungle logo" />

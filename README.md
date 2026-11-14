@@ -6,7 +6,7 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 
 | Feature | Details |
 |---------|---------|
-| 🗺 Interactive map | OpenStreetMap / Leaflet.js |
+| 🗺 Interactive map | OpenFreeMap vector tiles / MapLibre GL JS |
 | 🌡 Noise heatmap | Blue = quiet, Red = noisy |
 | 🏆 Quietest spots | Top 5 ranked markers on the map |
 | ⚖️ Adjustable road weights | Tune how much each road type contributes to noise |
@@ -14,7 +14,7 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 
 ## How it works
 
-1. The app queries the [OpenStreetMap Overpass API](https://overpass-api.de/) for all highway features inside the current map view.
+1. The app reads roads, railways, landcover and waterways directly from the [OpenFreeMap](https://openfreemap.org/) vector tiles that also render the basemap - no Overpass call, no API key and no extra request per analysis.
 2. A 50×50 grid of sample points is laid over the view.
 3. For every grid point the **noise score** is computed as:
 
@@ -24,7 +24,7 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 
    where `dist` is the shortest distance from the point to the segment (in metres) and `weight` reflects the road type (motorway = 10, path = 0.2, etc.).
 
-4. Scores are normalised and rendered as a colour heatmap (Leaflet.heat).
+4. Scores are normalised and rendered as a MapLibre heatmap layer.
 5. The five grid points with the **lowest** noise score are shown as ranked markers.
 
 ## Road noise weights (defaults)
@@ -41,13 +41,33 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 
 Weights can be adjusted live using the sidebar sliders.
 
+## Map data and licensing
+
+The basemap and all analysed road/railway/landcover data come from
+**OpenFreeMap**, which serves OpenStreetMap data as vector tiles:
+
+- free for private and commercial use, no API key, no registration, no cookies
+- requires visible attribution: `© OpenStreetMap contributors` and OpenFreeMap
+  (shown in the map attribution control and the sidebar footer)
+- OpenStreetMap data is licensed under the
+  [ODbL 1.0](https://opendatacommons.org/licenses/odbl/); any derived database
+  must be shared under the same licence
+- the app reads the tiles that are already loaded, so **no Overpass API calls**
+  are made and no separate road-data service is needed
+
+Nominatim (geocoding) and the public OSRM demo server (routing) are used only
+for the optional navigation feature and for light, interactive use. For a
+production release with heavy traffic, self-host them or use a commercial
+provider with a usage agreement.
+
 ## Usage
 
 Open `index.html` in any modern browser (no build step required).  
 Pan & zoom the map to your area of interest, then click **Analyze Current View**.
 
-> **Tip:** Use a zoom level of 10–13 for best results.  
-> Very large areas may time out due to Overpass API limits.
+> **Tip:** Use a zoom level of 10–14 for best results.  
+> Analysis works on the tiles that are currently loaded, so zoom in when the
+> current view is very large.
 
 ## Android APK build
 
@@ -306,10 +326,9 @@ every request.
 
 ## Tech stack
 
-- [Leaflet.js 1.9](https://leafletjs.com/) – map rendering
-- [Leaflet.heat](https://github.com/Leaflet/Leaflet.heat) – heatmap layer
-- [OpenStreetMap Overpass API](https://overpass-api.de/) – road data
-- [Android WebView](https://developer.android.com/reference/android/webkit/WebView) + Kotlin – native Android packaging
+- [MapLibre GL JS](https://maplibre.org/) - vector map rendering and heatmap layer
+- [OpenFreeMap](https://openfreemap.org/) - free, key-less vector tiles and road data
+- [Android WebView](https://developer.android.com/reference/android/webkit/WebView) + Kotlin - native Android packaging
 - [Fused Location Provider](https://developers.google.com/location-context/fused-location-provider) – native GPS on Android
 - PHP 8.0+ / MySQL 5.7+ (optional persistent backend – `apps/wild/`)
 

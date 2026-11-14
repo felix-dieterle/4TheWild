@@ -750,3 +750,33 @@ button.secondary:hover { color: var(--danger); border-color: var(--danger); filt
   color: var(--text);
   word-break: break-word;
 }
+
+/* MapLibre GL overrides (OpenFreeMap vector basemap) */
+#map { position: relative; background: #14191f; }
+.maplibregl-map { font-family: inherit; }
+.maplibregl-ctrl-group { background: var(--surface); border: 1px solid var(--border); }
+.maplibregl-ctrl-group button { background: transparent; }
+.maplibregl-ctrl-group button span { filter: invert(0.8); }
+.maplibregl-ctrl-attrib {
+  background: rgba(13, 32, 16, 0.78) !important;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+.maplibregl-ctrl-attrib a { color: var(--text); }
+.maplibregl-popup-content {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  padding: 10px 14px;
+}
+.maplibregl-popup-tip { border-top-color: var(--surface) !important; border-bottom-color: var(--surface) !important; }
+.maplibregl-popup-close-button {
+  color: var(--muted) !important;
+  padding: 0 4px;
+  font-size: 18px;
+}
+.maplibregl-popup-close-button:hover { color: var(--text) !important; background: transparent; }

@@ -1,8 +1,9 @@
 /**
  * 4TheWild – Silent Place Finder
  *
- * Fetches road and railway data from the OpenStreetMap Overpass API and
- * computes a noise-weighted heatmap. Each road/railway type gets a base
+ * Reads roads, railways and landcover from the OpenFreeMap vector tiles
+ * (OpenStreetMap data, ODbL) and computes a noise-weighted heatmap.
+ * Each road/railway type gets a base
  * weight reflecting its typical traffic noise, further refined by a dynamic
  * per-way factor that accounts for the way's tagged speed limit (maxspeed)
  * and, for roads, the lane count.
@@ -27,7 +28,7 @@
  */
 
 /* ── App version & build ─────────────────────────────────────────── */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const APP_BUILD   = 1;
 
 /* ── Vegetation noise-dampening factors (0 = no reduction, 1 = full) */
@@ -520,15 +521,290 @@ function fetchCurrentPosition(opts) {
 }
 
 /* ── Map initialisation ──────────────────────────────────────────── */
-/* tap:false disables Leaflet's custom tap emulation so that the     */
-/* Android WebView can rely on native touch-to-click conversion.     */
-/* Without this, marker popups are not triggered by touch on Android.*/
-const map = L.map('map', { zoomControl: true, tap: false }).setView([47.7728, 9.0883], 13);
+/* OpenFreeMap public vector tiles: free for any use (including commercial),
+ * no API key, no registration. Attribution is required and shown below. */
+const OPENFREEMAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+const VECTOR_SOURCE_ID  = 'openmaptiles';
 
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-  maxZoom: 19,
-}).addTo(map);
+const map = new maplibregl.Map({
+  container: 'map',
+  style: OPENFREEMAP_STYLE,
+  center: [9.0883, 47.7728],
+  zoom: 13,
+  attributionControl: false,
+  maplibreLogo: false,
+  dragRotate: false,
+  pitchWithRotate: false,
+});
+
+map.addControl(new maplibregl.AttributionControl({
+  compact: true,
+  customAttribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}), 'bottom-right');
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+/* ------------------------------------------------------------------ *
+ * Minimal Leaflet-compatible helpers on top of MapLibre GL.
+ * Keeps the rendering code below compact and easy to read.
+ * ------------------------------------------------------------------ */
+const nativeRemoveLayer  = map.removeLayer.bind(map);
+const nativeRemoveSource = map.removeSource.bind(map);
+const nativeFitBounds    = map.fitBounds.bind(map);
+
+map.setView = (latlng, zoom) => map.jumpTo({ center: [latlng[1], latlng[0]], zoom });
+map.fitBounds = (bounds, opts) =>
+  nativeFitBounds(bounds && bounds.__bounds ? bounds.__bounds : bounds, opts);
+map.removeLayer = (obj) => {
+  if (!obj) return;
+  if (typeof obj.__remove === 'function') { obj.__remove(); return; }
+  const id = typeof obj === 'string' ? obj : obj.id;
+  if (!id) return;
+  try { if (map.getLayer(id)) nativeRemoveLayer(id); } catch { /* ignore */ }
+  try { if (map.getSource(id)) nativeRemoveSource(id); } catch { /* ignore */ }
+};
+
+let __overlaySeq = 0;
+
+/* isStyleLoaded() turns false again while a newly added source is loading,
+ * so track the one-time initial load event instead. */
+let mapReady = false;
+map.on('load', () => { mapReady = true; });
+
+/** Run a source/layer creation callback once the map has initially loaded. */
+function whenStyleReady(fn) {
+  if (mapReady) fn();
+  else map.once('load', fn);
+}
+
+function divIcon(opts) { return opts || {}; }
+
+function latLngBounds(points) {
+  const b = new maplibregl.LngLatBounds();
+  points.forEach(([lat, lng]) => b.extend([lng, lat]));
+  return { __bounds: b };
+}
+
+/**
+ * Leaflet-style marker on top of MapLibre, including popup support.
+ * @param {[number, number]|{lat:number,lng:number}} latlng
+ * @param {{icon?: {html?: string, className?: string, iconSize?: number[]}}} [opts]
+ */
+function makeMarker(latlng, opts = {}) {
+  const lat = Array.isArray(latlng) ? latlng[0] : latlng.lat;
+  const lng = Array.isArray(latlng) ? latlng[1] : latlng.lng;
+  const icon = opts.icon || {};
+  const el = document.createElement('div');
+  el.className = icon.className || '';
+  el.innerHTML = icon.html || '';
+  if (icon.iconSize) {
+    el.style.width  = icon.iconSize[0] + 'px';
+    el.style.height = icon.iconSize[1] + 'px';
+  }
+  const ml = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat([lng, lat]);
+
+  const api = {
+    _ml: ml,
+    _lat: lat,
+    _lng: lng,
+    _popup: null,
+    _popupHtml: null,
+    _popupOpts: null,
+    _onPopupOpen: null,
+    bindPopup(html, o) {
+      api._popupHtml = html;
+      api._popupOpts = o || {};
+      el.style.cursor = 'pointer';
+      el.addEventListener('click', (ev) => { ev.stopPropagation(); api.openPopup(); });
+      return api;
+    },
+    bindTooltip(text) { return api.bindPopup(String(text)); },
+    openPopup() {
+      if (!api._popupHtml) return api;
+      api.closePopup();
+      const pp = new maplibregl.Popup({
+        maxWidth: ((api._popupOpts && api._popupOpts.maxWidth) || 300) + 'px',
+        offset: 12,
+        closeButton: true,
+      }).setLngLat([api._lng, api._lat]).setHTML(api._popupHtml).addTo(map);
+      api._popup = pp;
+      if (api._onPopupOpen) {
+        try { api._onPopupOpen({ popup: { getElement: () => pp.getElement() } }); }
+        catch (e) { console.warn('popupopen handler failed:', e); }
+      }
+      return api;
+    },
+    closePopup() {
+      if (api._popup) { api._popup.remove(); api._popup = null; }
+      return api;
+    },
+    getLatLng() { return { lat: api._lat, lng: api._lng }; },
+    on(ev, fn) { if (ev === 'popupopen') api._onPopupOpen = fn; return api; },
+    addTo(target) {
+      if (!target || target === map) ml.addTo(map);
+      else if (typeof target._add === 'function') target._add(api);
+      return api;
+    },
+    _attach() { ml.addTo(map); },
+    _detach() { ml.remove(); api.closePopup(); },
+  };
+  return api;
+}
+
+function makeLayerGroup() {
+  const items = [];
+  const group = {
+    _items: items,
+    _onMap: false,
+    _add(item) {
+      items.push(item);
+      if (group._onMap && item._attach) item._attach();
+      return group;
+    },
+    addTo(target) {
+      if (target === map) {
+        group._onMap = true;
+        items.forEach((i) => { if (i._attach) i._attach(); });
+      }
+      return group;
+    },
+    __remove() {
+      items.forEach((i) => {
+        if (i._detach) i._detach();
+        else if (i.__remove) i.__remove();
+      });
+    },
+  };
+  return group;
+}
+
+/**
+ * Add a GeoJSON overlay (source + one or more layers) immediately.
+ * @param {Array<object>} features  GeoJSON features
+ * @param {Array<object>} layerSpecs  MapLibre layer specs ({id,type,paint,layout})
+ * @param {{tooltip?: string}} [options]
+ */
+function makeGeoOverlay(features, layerSpecs, options = {}) {
+  const id = 'ov-' + (++__overlaySeq);
+  const layerIds = layerSpecs.map((spec, idx) => `${id}-${spec.id || idx}`);
+  let removed = false;
+
+  whenStyleReady(() => {
+    if (removed) return;
+    map.addSource(id, {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features },
+    });
+    layerSpecs.forEach((spec, idx) => {
+      const layer = Object.assign({}, spec, { id: layerIds[idx], source: id });
+      map.addLayer(layer);
+    });
+  });
+
+  const overlay = {
+    id,
+    addTo(target) {
+      if (target && typeof target._add === 'function') target._add(overlay);
+      return overlay;
+    },
+    bindTooltip(text) {
+      const popup = new maplibregl.Popup({ closeButton: true, offset: 8 });
+      layerIds.forEach((lid) => {
+        map.on('click', lid, (ev) => {
+          popup.setLngLat(ev.lngLat).setText(String(text)).addTo(map);
+        });
+        map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer'; });
+        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = ''; });
+      });
+      return overlay;
+    },
+    __remove() {
+      removed = true;
+      layerIds.forEach((lid) => {
+        try { if (map.getLayer(lid)) nativeRemoveLayer(lid); } catch { /* ignore */ }
+      });
+      try { if (map.getSource(id)) nativeRemoveSource(id); } catch { /* ignore */ }
+    },
+  };
+
+  if (options.tooltip) overlay.bindTooltip(options.tooltip);
+  return overlay;
+}
+
+function makeHeatLayer(points, opts = {}) {
+  const id = 'heat-' + (++__overlaySeq);
+  const features = points.map(([lat, lng, weight]) => {
+    const w = Number(weight) || 0;
+    /* Square-root boosts mid-range noise so secondary roads remain visible
+     * next to very loud motorways, without changing the underlying scores. */
+    return {
+      type: 'Feature',
+      properties: { w: Math.sqrt(w) },
+      geometry: { type: 'Point', coordinates: [lng, lat] },
+    };
+  });
+  let removed = false;
+  whenStyleReady(() => {
+    if (removed) return;
+    map.addSource(id, { type: 'geojson', data: { type: 'FeatureCollection', features } });
+    map.addLayer({
+    id,
+    type: 'heatmap',
+    source: id,
+    paint: {
+      'heatmap-weight': ['get', 'w'],
+      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 1.0, 13, 2.0, 18, 2.8],
+      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 7, 13, 24, 18, 38],
+      'heatmap-opacity': opts.opacity != null ? opts.opacity : 0.65,
+      'heatmap-color': [
+        'interpolate', ['linear'], ['heatmap-density'],
+        0.00, 'rgba(96,165,250,0)',
+        0.25, 'rgba(96,165,250,0.65)',
+        0.45, 'rgba(52,211,153,0.75)',
+        0.60, 'rgba(250,204,21,0.85)',
+        0.80, 'rgba(251,146,60,0.90)',
+        1.00, 'rgba(248,113,113,0.95)',
+      ],
+    },
+    });
+  });
+
+  return {
+    id,
+    addTo() { return this; },
+    setOptions(o) {
+      if (o.opacity != null) map.setPaintProperty(id, 'heatmap-opacity', o.opacity);
+      if (o.blur != null) {
+        map.setPaintProperty(id, 'heatmap-radius', Math.max(6, o.blur + 5));
+      }
+    },
+    __remove() {
+      removed = true;
+      try { if (map.getLayer(id)) nativeRemoveLayer(id); } catch { /* ignore */ }
+      try { if (map.getSource(id)) nativeRemoveSource(id); } catch { /* ignore */ }
+    },
+  };
+}
+
+function circlePolygon(lat, lng, radiusM, steps = 64) {
+  const pts = [];
+  const dLat = radiusM / 111320;
+  const dLng = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
+  for (let i = 0; i <= steps; i++) {
+    const a = (i / steps) * Math.PI * 2;
+    pts.push([lng + dLng * Math.cos(a), lat + dLat * Math.sin(a)]);
+  }
+  return pts;
+}
+
+/* Small Leaflet-compatible surface used by the rest of the file. */
+const L = {
+  divIcon,
+  marker: makeMarker,
+  layerGroup: makeLayerGroup,
+  heatLayer: makeHeatLayer,
+  latLngBounds,
+};
 
 /* ── Map loading overlay ─────────────────────────────────────────── */
 /* Created programmatically so it lives inside the Leaflet container  */
@@ -554,15 +830,25 @@ const mapLoadingText = mapLoadingEl.querySelector('.map-loading-text');
 function placeLocationMarker(lat, lng, accuracy) {
   if (locationMarker) { map.removeLayer(locationMarker); locationMarker = null; }
   if (locationCircle) { map.removeLayer(locationCircle); locationCircle = null; }
-  locationCircle = L.circle([lat, lng], {
-    radius: accuracy, color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.10, weight: 1,
-  }).addTo(map);
+  locationCircle = makeGeoOverlay([{
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Polygon', coordinates: [circlePolygon(lat, lng, accuracy || 25)] },
+  }], [{
+    id: 'accuracy-fill',
+    type: 'fill',
+    paint: { 'fill-color': '#60a5fa', 'fill-opacity': 0.10 },
+  }, {
+    id: 'accuracy-line',
+    type: 'line',
+    paint: { 'line-color': '#60a5fa', 'line-width': 1, 'line-opacity': 0.6 },
+  }]).addTo(map);
   locationMarker = L.marker([lat, lng], {
     icon: L.divIcon({
       className: '', html: '<div class="location-dot"></div>',
       iconSize: [16, 16], iconAnchor: [8, 8],
     }),
-  }).bindPopup('📍 Your current location').addTo(map);
+  }).bindPopup('?? Your current location').addTo(map);
 }
 
 /**
@@ -713,18 +999,23 @@ async function updateLocationStatus() {
 })();
 
 /* ── GPS Locate control ──────────────────────────────────────────── */
-const LocateControl = L.Control.extend({
+class LocateControl {
   onAdd() {
-    const btn = L.DomUtil.create('button', 'locate-btn');
+    const wrap = document.createElement('div');
+    wrap.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const btn = document.createElement('button');
     btn.type      = 'button';
-    btn.innerHTML = '📍';
+    btn.className = 'locate-btn';
+    btn.innerHTML = '&#9678;';
     btn.title     = 'Center map on my location';
     btn.setAttribute('aria-label', 'Center map on my location');
-    L.DomEvent.disableClickPropagation(btn).on(btn, 'click', locateMe);
-    return btn;
-  },
-});
-new LocateControl({ position: 'bottomright' }).addTo(map);
+    btn.addEventListener('click', (ev) => { ev.stopPropagation(); locateMe(); });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+  onRemove() {}
+}
+map.addControl(new LocateControl(), 'bottom-right');
 
 /**
  * Request the device's current GPS position, pan the map to it, and place
@@ -1027,7 +1318,16 @@ async function calculateRoute() {
     const modeColors = NAV_MODE_COLORS;
     const lineColor  = modeColors[navMode] || NAV_MODE_COLORS.driving;
 
-    L.polyline(latLngs, { color: lineColor, weight: 5, opacity: 0.85 }).addTo(routeLayer);
+    makeGeoOverlay([{
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: route.coordinates },
+    }], [{
+      id: 'route',
+      type: 'line',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': lineColor, 'line-width': 5, 'line-opacity': 0.85 },
+    }]).addTo(routeLayer);
 
     /* Origin marker */
     L.marker([fromLat, fromLon], {
@@ -1108,7 +1408,16 @@ async function navigateToCoords(lat, lng, label) {
     /* Route polyline */
     const latLngs  = route.coordinates.map(([lon, rlat]) => [rlat, lon]);
     const lineColor = NAV_MODE_COLORS[navMode] || NAV_MODE_COLORS.driving;
-    L.polyline(latLngs, { color: lineColor, weight: 5, opacity: 0.85 }).addTo(routeLayer);
+    makeGeoOverlay([{
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: route.coordinates },
+    }], [{
+      id: 'route',
+      type: 'line',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': lineColor, 'line-width': 5, 'line-opacity': 0.85 },
+    }]).addTo(routeLayer);
 
     /* Origin marker */
     L.marker([fromLat, fromLon], {
@@ -1198,7 +1507,8 @@ function bindPopupNavBtn(marker, lat, lng, label) {
 }
 
 map.on('click', function onMapClick(e) {
-  const { lat, lng } = e.latlng;
+  const lat = e.lngLat ? e.lngLat.lat : e.latlng.lat;
+  const lng = e.lngLat ? e.lngLat.lng : e.latlng.lng;
 
   /* Remove any existing click marker */
   if (mapClickMarker) {
@@ -1859,7 +2169,7 @@ async function runAnalysis() {
     ]);
 
     if (!ways.length) {
-      showStatus('⚠️ No road data found. The Overpass API may be temporarily unavailable — try again in a moment, or pan to an area with cached data.', 'error');
+      showStatus('?? No roads in the loaded map data for this view. Zoom in a little or pan to a mapped area, then try again.', 'error');
       return;
     }
 
@@ -1882,10 +2192,11 @@ async function runAnalysis() {
       ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays,
     );
 
-    renderHeatmap(heatPoints);
-    renderTripRects(plannedTrips);
+    /* Vegetation and terrain sit below the heatmap so they never tint it. */
     renderVegetationLayer(useVeg ? vegetation : []);
     renderTerrainLayer(useTerrain ? terrainWays : []);
+    renderHeatmap(heatPoints);
+    renderTripRects(plannedTrips);
     renderUnreachableOverlay(unreachablePoints, bounds);
     if (useTerrain && terrainWays.length) {
       terrainLegendEl.classList.remove('hidden');
@@ -1909,11 +2220,9 @@ async function runAnalysis() {
     console.error(err);
     logError('Analysis', err.message, err.status);
     if (err.name === 'AbortError') {
-      showStatus('❌ Request timed out. Try a smaller area or retry in a moment.', 'error');
-    } else if (err.status === 429) {
-      showStatus('⚠️ Overpass API rate limit reached. Please wait a moment and try again.', 'error');
+      showStatus('? Request timed out. Try a smaller area or retry in a moment.', 'error');
     } else {
-      showStatus(`❌ Error: ${err.message}`, 'error');
+      showStatus(`? Error: ${err.message}`, 'error');
     }
   } finally {
     analyzing = false;
@@ -1922,67 +2231,159 @@ async function runAnalysis() {
   }
 }
 
-/* ── Overpass API ────────────────────────────────────────────────── */
+/* -- OpenFreeMap vector data ----------------------------------------
+ * Roads, railways, vegetation, waterways and terrain are read directly
+ * from the same OpenFreeMap vector tiles that render the map.  The data
+ * is ODbL licensed, OpenFreeMap's public instance is free for any use
+ * (no API key, no registration) and no Overpass API is involved.
+ * ------------------------------------------------------------------ */
 
-/**
- * Fetch road ways for the given bounds using a three-tier strategy:
- *  1. On-device localStorage cache (instant, survives app restarts)
- *  2. Backend road cache  (shared across users, only calls Overpass on miss)
- *  3. Direct Overpass API (fallback when backend is unreachable)
- *
- * Successful responses from tier 2 or 3 are stored in localStorage
- * so the next request in the same session is served from tier 1.
- *
- * @param {L.LatLngBounds} bounds
- * @returns {Promise<Array>} Overpass way elements
- */
-async function fetchRoads(bounds) {
-  /* ── Tier 1: on-device cache ──────────────────────────────────── */
-  const cached = getCachedRoads(bounds);
-  if (cached) return cached;
-
-  /* ── Tier 2: backend road cache ───────────────────────────────── */
-  const params = new URLSearchParams({
-    south: bounds.getSouth().toFixed(6),
-    west:  bounds.getWest().toFixed(6),
-    north: bounds.getNorth().toFixed(6),
-    east:  bounds.getEast().toFixed(6),
+/** Wait until the style and all visible tiles have finished loading. */
+function waitForVectorData() {
+  return new Promise((resolve) => {
+    if (map.isStyleLoaded() && map.areTilesLoaded()) { resolve(); return; }
+    const done = () => { map.off('idle', done); resolve(); };
+    map.on('idle', done);
   });
-  try {
-    const resp = await fetch(`${TRIP_API_BASE}/api/roads?${params}`);
-    if (resp.ok) {
-      const data = await resp.json();
-      const ways = data.ways || [];
-      setCachedRoads(bounds, ways);
-      return ways;
-    }
-  } catch {
-    /* Backend unavailable – fall through to direct Overpass */
+}
+
+/** Deduplicate vector-tile features that repeat across tile borders. */
+function vectorFeatureKey(feature, props) {
+  const geom = feature.geometry;
+  let anchor = '';
+  if (geom && geom.type === 'LineString' && geom.coordinates.length) {
+    anchor = geom.coordinates[0].join(',');
+  } else if (geom && geom.type === 'Polygon' && geom.coordinates[0] && geom.coordinates[0].length) {
+    anchor = geom.coordinates[0][0].join(',');
+  } else if (geom && geom.type === 'MultiPolygon' && geom.coordinates[0] && geom.coordinates[0][0]) {
+    anchor = geom.coordinates[0][0][0].join(',');
   }
+  return `${props.class || ''}|${props.subclass || ''}|${props.brunnel || ''}|${anchor}`;
+}
 
-  /* ── Tier 3: direct Overpass API ──────────────────────────────── */
-  const s = bounds.getSouth().toFixed(6);
-  const w = bounds.getWest().toFixed(6);
-  const n = bounds.getNorth().toFixed(6);
-  const e = bounds.getEast().toFixed(6);
-  const bbox = `${s},${w},${n},${e}`;
+/** Collect line features from a vector source layer. */
+function queryLineFeatures(sourceLayer) {
+  const raw = map.querySourceFeatures(VECTOR_SOURCE_ID, { sourceLayer });
+  const seen = new Set();
+  const out = [];
+  for (const f of raw) {
+    const g = f.geometry;
+    if (!g) continue;
+    const props = f.properties || {};
+    const key = vectorFeatureKey(f, props);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const lines = g.type === 'LineString' ? [g.coordinates]
+      : g.type === 'MultiLineString' ? g.coordinates : [];
+    for (const coords of lines) {
+      if (!coords || coords.length < 2) continue;
+      out.push({ props, coords });
+    }
+  }
+  return out;
+}
 
-  const query = `[out:json][timeout:${OVERPASS_TIMEOUT_S}];way["highway"](${bbox});out geom;`;
+/** Collect polygon rings from a vector source layer. */
+function queryPolygonFeatures(sourceLayer) {
+  const raw = map.querySourceFeatures(VECTOR_SOURCE_ID, { sourceLayer });
+  const seen = new Set();
+  const out = [];
+  for (const f of raw) {
+    const g = f.geometry;
+    if (!g) continue;
+    const props = f.properties || {};
+    const key = vectorFeatureKey(f, props);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const rings = [];
+    if (g.type === 'Polygon') {
+      if (g.coordinates[0]) rings.push(g.coordinates[0]);
+    } else if (g.type === 'MultiPolygon') {
+      g.coordinates.forEach((poly) => { if (poly[0]) rings.push(poly[0]); });
+    }
+    for (const ring of rings) {
+      if (ring && ring.length >= 4) out.push({ props, ring });
+    }
+  }
+  return out;
+}
 
-  try {
-    const elements = await fetchFromOverpass(query);
-    setCachedRoads(bounds, elements);
-    return elements;
-  } catch (err) {
-    console.warn('Road fetch from Overpass failed:', err.message);
-    logError('Roads', `Overpass unavailable: ${err.message}`, err.status);
-    return [];
+function coordsToGeometry(coords) {
+  return coords.map(([lon, lat]) => ({ lat, lon }));
+}
+
+/** Map OpenMapTiles road classes onto OSM highway tags. */
+function highwayTagFor(props) {
+  const cls = props.class || '';
+  const sub = props.subclass || '';
+  const isLink = props.ramp === 1 || props.ramp === true;
+  switch (cls) {
+    case 'motorway':  return isLink ? 'motorway_link' : 'motorway';
+    case 'trunk':     return isLink ? 'trunk_link' : 'trunk';
+    case 'primary':   return isLink ? 'primary_link' : 'primary';
+    case 'secondary': return isLink ? 'secondary_link' : 'secondary';
+    case 'tertiary':  return isLink ? 'tertiary_link' : 'tertiary';
+    case 'minor':     return 'residential';
+    case 'street':
+    case 'street_limited': return 'unclassified';
+    case 'service':   return 'service';
+    case 'track':     return 'track';
+    case 'path':
+      if (sub === 'cycleway') return 'cycleway';
+      if (sub === 'footway') return 'footway';
+      if (sub === 'pedestrian') return 'pedestrian';
+      if (sub === 'steps') return 'steps';
+      return 'path';
+    case 'pedestrian': return 'pedestrian';
+    default: return null;
   }
 }
 
+/** Map OpenMapTiles railway classes onto OSM railway tags. */
+function railwayTagFor(props) {
+  if (props.class === 'rail') return 'rail';
+  if (props.class === 'transit') {
+    const sub = props.subclass || 'tram';
+    return DEFAULT_RAILWAY_WEIGHTS[sub] ? sub : 'tram';
+  }
+  return null;
+}
+
+/** Map OpenMapTiles landcover classes onto vegetation keys. */
+function vegetationTypeFor(props) {
+  const cls = props.class || '';
+  const sub = props.subclass || '';
+  if (cls === 'wood' || sub === 'wood' || sub === 'forest') return 'wood';
+  if (cls === 'grass' || cls === 'grassland') return 'grass';
+  if (cls === 'wetland') return 'wetland';
+  if (cls === 'farmland') return 'meadow';
+  if (cls === 'scrub') return 'scrub';
+  if (cls === 'heath') return 'heath';
+  return null;
+}
+
 /**
- * Fetch vegetation polygons (forests, scrubland, wetlands, etc.) for the
- * given bounds via Overpass, caching the result in localStorage.
+ * Road ways for the given bounds, read from the loaded OpenFreeMap tiles.
+ * @param {L.LatLngBounds} bounds
+ * @returns {Promise<Array>} way elements with OSM-style tags
+ */
+async function fetchRoads(bounds) {
+  const cached = getCachedRoads(bounds);
+  if (cached) return cached;
+
+  await waitForVectorData();
+  const ways = [];
+  for (const { props, coords } of queryLineFeatures('transportation')) {
+    const highway = highwayTagFor(props);
+    if (!highway) continue;
+    ways.push({ tags: { highway }, geometry: coordsToGeometry(coords) });
+  }
+  setCachedRoads(bounds, ways);
+  return ways;
+}
+
+/**
+ * Vegetation polygons (forests, grassland, wetlands, farmland).
  * @param {L.LatLngBounds} bounds
  * @returns {Promise<Array>} Pre-processed polygon objects with bounding boxes
  */
@@ -1990,194 +2391,93 @@ async function fetchVegetation(bounds) {
   const cached = getCachedVegetation(bounds);
   if (cached) return cached;
 
-  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
-  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
-  const bbox = `${s},${w},${n},${e}`;
-  const query =
-    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
-    `(way["natural"~"^(wood|scrub|heath|wetland|grassland)$"](${bbox});` +
-    `way["landuse"~"^(forest|meadow|grass|orchard|vineyard)$"](${bbox}););` +
-    `out geom;`;
-  try {
-    const elements = await fetchFromOverpass(query);
-    const polys = elements
-      .filter(el => el.geometry && el.geometry.length >= 3)
-      .map(el => ({
-        type:    el.tags.natural || el.tags.landuse || '',
-        geometry: el.geometry,
-        minLat:  Math.min(...el.geometry.map(p => p.lat)),
-        maxLat:  Math.max(...el.geometry.map(p => p.lat)),
-        minLon:  Math.min(...el.geometry.map(p => p.lon)),
-        maxLon:  Math.max(...el.geometry.map(p => p.lon)),
-      }));
-    setCachedVegetation(bounds, polys);
-    return polys;
-  } catch (err) {
-    console.warn('Vegetation fetch failed:', err.message);
-    return [];
+  await waitForVectorData();
+  const polys = [];
+  for (const { props, ring } of queryPolygonFeatures('landcover')) {
+    const type = vegetationTypeFor(props);
+    if (!type) continue;
+    const geometry = coordsToGeometry(ring);
+    polys.push({
+      type,
+      geometry,
+      minLat: Math.min(...geometry.map((p) => p.lat)),
+      maxLat: Math.max(...geometry.map((p) => p.lat)),
+      minLon: Math.min(...geometry.map((p) => p.lon)),
+      maxLon: Math.max(...geometry.map((p) => p.lon)),
+    });
   }
+  setCachedVegetation(bounds, polys);
+  return polys;
 }
 
 /**
- * Fetch difficult terrain paths (sac_scale hiking routes, rough tracks)
- * for the given bounds via Overpass, caching the result in localStorage.
+ * Rough terrain tracks from the vector tiles.
+ * OpenMapTiles does not carry sac_scale/tracktype, so every track is
+ * treated as a rough track (grade 4/5) for the accessibility layer.
  * @param {L.LatLngBounds} bounds
- * @returns {Promise<Array>} Overpass way elements
+ * @returns {Promise<Array>} way elements
  */
 async function fetchTerrain(bounds) {
   const cached = getCachedTerrain(bounds);
   if (cached) return cached;
 
-  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
-  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
-  const bbox = `${s},${w},${n},${e}`;
-  const query =
-    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
-    `(way["highway"]["sac_scale"](${bbox});` +
-    `way["highway"="track"]["tracktype"~"^(grade4|grade5)$"](${bbox}););` +
-    `out geom;`;
-  try {
-    const elements = await fetchFromOverpass(query);
-    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
-    setCachedTerrain(bounds, ways);
-    return ways;
-  } catch (err) {
-    console.warn('Terrain fetch failed:', err.message);
-    return [];
+  await waitForVectorData();
+  const ways = [];
+  for (const { props, coords } of queryLineFeatures('transportation')) {
+    if (props.class !== 'track') continue;
+    ways.push({
+      tags: { highway: 'track', tracktype: 'grade4' },
+      geometry: coordsToGeometry(coords),
+    });
   }
+  setCachedTerrain(bounds, ways);
+  return ways;
 }
 
 /**
- * Fetch railway ways (rail, tram, subway, etc.) for the given bounds via
- * Overpass, caching the result in localStorage.
+ * Railway ways (rail, tram, subway, light rail, ...).
  * @param {L.LatLngBounds} bounds
- * @returns {Promise<Array>} Overpass way elements
+ * @returns {Promise<Array>} way elements
  */
 async function fetchRailways(bounds) {
   const cached = getCachedRailways(bounds);
   if (cached) return cached;
 
-  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
-  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
-  const bbox = `${s},${w},${n},${e}`;
-  const query =
-    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
-    `way["railway"~"^(rail|tram|subway|light_rail|narrow_gauge|monorail|preserved)$"](${bbox});` +
-    `out geom;`;
-  try {
-    const elements = await fetchFromOverpass(query);
-    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
-    setCachedRailways(bounds, ways);
-    return ways;
-  } catch (err) {
-    console.warn('Railway fetch failed:', err.message);
-    return [];
+  await waitForVectorData();
+  const ways = [];
+  for (const { props, coords } of queryLineFeatures('transportation')) {
+    const railway = railwayTagFor(props);
+    if (!railway) continue;
+    ways.push({ tags: { railway }, geometry: coordsToGeometry(coords) });
   }
+  setCachedRailways(bounds, ways);
+  return ways;
 }
 
 /**
- * Fetch navigable waterway ways (rivers, streams, canals, etc.) for the
- * given bounds via Overpass, caching the result in localStorage.
+ * Navigable waterway ways (rivers, streams, canals, ...).
  * Used for kayaking/canoeing reachability analysis.
  * @param {L.LatLngBounds} bounds
- * @returns {Promise<Array>} Overpass way elements
+ * @returns {Promise<Array>} way elements
  */
 async function fetchWaterways(bounds) {
   const cached = getCachedWaterways(bounds);
   if (cached) return cached;
 
-  const s = bounds.getSouth().toFixed(6), w = bounds.getWest().toFixed(6);
-  const n = bounds.getNorth().toFixed(6), e = bounds.getEast().toFixed(6);
-  const bbox = `${s},${w},${n},${e}`;
-  const query =
-    `[out:json][timeout:${OVERPASS_TIMEOUT_S}];` +
-    `way["waterway"~"^(river|stream|canal|drain|ditch)$"](${bbox});` +
-    `out geom;`;
-  try {
-    const elements = await fetchFromOverpass(query);
-    const ways = elements.filter(el => el.geometry && el.geometry.length >= 2);
-    setCachedWaterways(bounds, ways);
-    return ways;
-  } catch (err) {
-    console.warn('Waterway fetch failed:', err.message);
-    return [];
+  await waitForVectorData();
+  const allowed = new Set(['river', 'stream', 'canal', 'drain', 'ditch']);
+  const ways = [];
+  for (const { props, coords } of queryLineFeatures('waterway')) {
+    if (!allowed.has(props.class)) continue;
+    ways.push({ tags: { waterway: props.class }, geometry: coordsToGeometry(coords) });
   }
+  setCachedWaterways(bounds, ways);
+  return ways;
 }
-const GRID_SIZE = 50; /* points per axis → 50×50 = 2 500 sample points */
-const OVERPASS_TIMEOUT_S   = 25;   /* server-side timeout in seconds */
-const OVERPASS_ABORT_MS    = (OVERPASS_TIMEOUT_S + 3) * 1000; /* client abort with grace period */
+
+const GRID_SIZE = 50; /* points per axis - 50x50 = 2 500 sample points */
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
-/**
- * Public Overpass API mirrors tried in order.  If the primary returns 504 or
- * times out the next mirror is tried automatically so a single overloaded
- * instance does not cause a total failure.
- */
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://lz4.overpass-api.de/api/interpreter',
-  'https://overpass.openstreetmap.fr/api/interpreter',
-];
-/** Number of full passes through all mirrors before giving up. */
-const OVERPASS_MAX_PASSES = 2;
-/** Base delay (ms) before the second pass – gives overloaded mirrors time to recover. */
-const OVERPASS_RETRY_DELAY_MS = 3000;
-
-/**
- * Post a query to Overpass, automatically retrying against each mirror in
- * turn.  If every mirror fails on a pass the function waits
- * OVERPASS_RETRY_DELAY_MS before starting a second pass, giving overloaded
- * servers a chance to recover before it throws for good.
- * @param {string} query  OverpassQL query string
- * @returns {Promise<Array>} Overpass elements array
- */
-async function fetchFromOverpass(query) {
-  const body = `data=${encodeURIComponent(query)}`;
-  let lastErr;
-  for (let pass = 0; pass < OVERPASS_MAX_PASSES; pass++) {
-    if (pass > 0) {
-      /* Brief pause before the second pass so transiently overloaded mirrors
-       * have a moment to recover. */
-      await sleep(OVERPASS_RETRY_DELAY_MS * pass);
-    }
-    for (const url of OVERPASS_ENDPOINTS) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), OVERPASS_ABORT_MS);
-        let resp;
-        try {
-          resp = await fetch(url, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body,
-            signal:  controller.signal,
-          });
-        } finally {
-          clearTimeout(timer);
-        }
-        if (resp.status === 504 || resp.status === 502 || resp.status === 429) {
-          const err = new Error(`HTTP ${resp.status}`);
-          err.status = resp.status;
-          throw err;
-        }
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        return data.elements || [];
-      } catch (err) {
-        lastErr = err;
-        const retryable = err.name === 'AbortError' ||
-                          err.status === 504 || err.status === 502 || err.status === 429 ||
-                          err.name === 'TypeError'; /* network-level failure */
-        if (!retryable) throw err;
-        logError('Overpass', `Mirror ${url} failed: ${err.message}`, err.status);
-        console.warn(`Overpass mirror ${url} failed (${err.message}), trying next…`);
-      }
-    }
-  }
-  throw lastErr;
-}
-
 /* Speed plausibility bounds for dynamicNoiseFactor().
  * Speeds below MIN_PLAUSIBLE_SPEED_KMH (e.g. a mapped "5" on a cycle path)
  * or above MAX_PLAUSIBLE_SPEED_KMH are clamped to prevent extreme factors
@@ -2718,84 +3018,82 @@ function renderResults(points) {
  * @param {Array<{south:number,west:number,north:number,east:number,id:string}>} trips
  */
 function renderTripRects(trips) {
-  /* Remove previous rectangles */
   tripRects.forEach(r => map.removeLayer(r));
   tripRects = [];
+  if (!trips.length) return;
 
-  trips.forEach(t => {
-    const rect = L.rectangle(
-      [[t.south, t.west], [t.north, t.east]],
-      {
-        color:     '#f59e0b',
-        weight:    1.5,
-        fillColor: '#f59e0b',
-        fillOpacity: 0.12,
-        dashArray: '4 4',
-      }
-    ).bindTooltip('Planned trip area – silence score adjusted')
-     .addTo(map);
-    tripRects.push(rect);
-  });
+  const features = trips.map(t => ({
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [t.west, t.south], [t.east, t.south],
+        [t.east, t.north], [t.west, t.north], [t.west, t.south],
+      ]],
+    },
+  }));
+
+  tripRects.push(makeGeoOverlay(features, [{
+    id: 'trips',
+    type: 'fill',
+    paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.12 },
+  }, {
+    id: 'trips-line',
+    type: 'line',
+    paint: { 'line-color': '#f59e0b', 'line-width': 1.5, 'line-dasharray': [4, 4] },
+  }], { tooltip: 'Planned trip area - silence score adjusted' }).addTo(map));
 }
 
-/* ── Vegetation overlay ──────────────────────────────────────────── */
-
-/**
- * Draw semi-transparent green polygons for vegetation areas so users can
- * see where noise dampening is being applied.
- * @param {Array} polys  Pre-processed polygon objects from fetchVegetation()
- */
 function renderVegetationLayer(polys) {
   if (vegetationLayer) { map.removeLayer(vegetationLayer); vegetationLayer = null; }
   if (!polys.length) return;
-  vegetationLayer = L.layerGroup();
-  polys.forEach(vp => {
-    const latLngs = vp.geometry.map(p => [p.lat, p.lon]);
-    L.polygon(latLngs, {
-      color: '#4ade80', weight: 0.8,
-      fillColor: '#4ade80', fillOpacity: 0.15,
-    }).bindTooltip(`🌲 Vegetation: ${vp.type.replace(/_/g, ' ')}`)
-      .addTo(vegetationLayer);
+
+  const features = polys.map(vp => {
+    const ring = vp.geometry.map(p => [p.lon, p.lat]);
+    ring.push([vp.geometry[0].lon, vp.geometry[0].lat]);
+    return {
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'Polygon', coordinates: [ring] },
+    };
   });
-  vegetationLayer.addTo(map);
+
+  vegetationLayer = makeGeoOverlay(features, [{
+    id: 'veg',
+    type: 'fill',
+    paint: { 'fill-color': '#4ade80', 'fill-opacity': 0.08 },
+  }, {
+    id: 'veg-line',
+    type: 'line',
+    paint: { 'line-color': '#4ade80', 'line-width': 0.6, 'line-opacity': 0.25 },
+  }], { tooltip: 'Vegetation - noise dampening applied' }).addTo(map);
 }
 
-/* ── Terrain accessibility overlay ──────────────────────────────── */
-
-/**
- * Draw polylines for rough/demanding terrain paths so users can assess
- * accessibility.  Colour-coded by difficulty.
- * @param {Array} ways  Overpass way elements from fetchTerrain()
- */
 function renderTerrainLayer(ways) {
   if (terrainLayer) { map.removeLayer(terrainLayer); terrainLayer = null; }
   if (!ways.length) return;
-  terrainLayer = L.layerGroup();
-  ways.forEach(way => {
-    const latLngs = way.geometry.map(p => [p.lat, p.lon]);
-    const sacScale  = way.tags && way.tags.sac_scale;
-    const tracktype = way.tags && way.tags.tracktype;
-    const isDemanding = sacScale && sacScale !== 'hiking';
-    const color = isDemanding ? TERRAIN_COLORS.demanding_trail : TERRAIN_COLORS.rough_track;
-    const label = sacScale
-      ? `🥾 Difficulty: ${sacScale.replace(/_/g, ' ')}`
-      : `🚧 Rough track (${tracktype})`;
-    L.polyline(latLngs, { color, weight: 2.5, opacity: 0.85 })
-      .bindTooltip(label)
-      .addTo(terrainLayer);
-  });
-  terrainLayer.addTo(map);
+
+  const features = ways.map(way => ({
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'LineString',
+      coordinates: way.geometry.map(p => [p.lon, p.lat]),
+    },
+  }));
+
+  terrainLayer = makeGeoOverlay(features, [{
+    id: 'terrain',
+    type: 'line',
+    paint: {
+      'line-color': TERRAIN_COLORS.rough_track,
+      'line-width': 2.5,
+      'line-opacity': 0.85,
+    },
+  }], { tooltip: 'Rough track - limited accessibility' }).addTo(map);
 }
 
-/* ── Unreachable-area overlay ────────────────────────────────────── */
-
-/**
- * Render a semi-transparent grey canvas overlay on the map for all grid
- * points that were outside the reachability threshold during the last
- * analysis run.  Removes any previously rendered overlay first.
- * @param {Array<{lat:number,lng:number}>} unreachablePoints
- * @param {L.LatLngBounds}                 bounds
- */
 function renderUnreachableOverlay(unreachablePoints, bounds) {
   if (unreachableOverlay) {
     map.removeLayer(unreachableOverlay);
@@ -2826,19 +3124,24 @@ function renderUnreachableOverlay(unreachablePoints, bounds) {
     ctx.fillRect(x - cellW / 2, y - cellH / 2, cellW, cellH);
   }
 
-  /* Use a dedicated Leaflet pane so the overlay sits above the heatmap
-   * but below markers and popups.                                       */
-  if (!map.getPane('unreachablePane')) {
-    map.createPane('unreachablePane');
-    map.getPane('unreachablePane').style.zIndex = '450';
-    map.getPane('unreachablePane').style.pointerEvents = 'none';
-  }
+  const id = 'unreachable-' + (++__overlaySeq);
+  map.addSource(id, {
+    type: 'canvas',
+    canvas,
+    coordinates: [
+      [lngMin, latMax], [lngMax, latMax],
+      [lngMax, latMin], [lngMin, latMin],
+    ],
+    animate: false,
+  });
+  map.addLayer({ id, type: 'raster', source: id, paint: { 'raster-opacity': 1 } });
 
-  unreachableOverlay = L.imageOverlay(canvas.toDataURL(), bounds, {
-    pane:        'unreachablePane',
-    interactive: false,
-    opacity:     1,
-  }).addTo(map);
+  unreachableOverlay = {
+    __remove() {
+      try { if (map.getLayer(id)) nativeRemoveLayer(id); } catch { /* ignore */ }
+      try { if (map.getSource(id)) nativeRemoveSource(id); } catch { /* ignore */ }
+    },
+  };
 }
 function showStatus(msg, type = 'info') {
   statusEl.textContent = msg;
