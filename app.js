@@ -415,8 +415,241 @@ let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
 /** Set of selected transport mode IDs (empty = no reachability filtering). */
 let selectedTransportModes = new Set();
+/** Max travel time in minutes for the reachability filter (0 = off). */
+let reachTimeBudgetMin = 0;
+/** Segment travel times of the last analysis (for click popups). */
+let lastReachCtx = null;
 /** Canvas imageOverlay for greying out unreachable grid cells. */
 let unreachableOverlay = null;
+
+/**
+ * Average speeds (km/h) per mode and OSM way type. Used for the travel-time
+ * budget. Values are rough planning speeds, not routing-grade.
+ */
+const MODE_SPEEDS_KMH = {
+  car: {
+    default: 45, motorway: 110, motorway_link: 70, trunk: 90, trunk_link: 70,
+    primary: 70, primary_link: 55, secondary: 60, secondary_link: 50,
+    tertiary: 50, tertiary_link: 45, residential: 30, living_street: 10,
+    service: 20, track: 15, unclassified: 40,
+  },
+  bike: {
+    default: 15, cycleway: 18, primary: 16, primary_link: 14, secondary: 17,
+    secondary_link: 15, tertiary: 17, tertiary_link: 14, residential: 15,
+    living_street: 10, service: 12, track: 11, path: 9, footway: 6,
+    pedestrian: 6, steps: 2, unclassified: 13,
+  },
+  foot: {
+    default: 4.5, steps: 1.5, track: 4, path: 4, footway: 4.5, pedestrian: 4.5,
+    cycleway: 4.5, primary: 4.8, secondary: 4.8, tertiary: 4.8, residential: 4.6,
+  },
+  climbing: { default: 3, steps: 1.2 },
+  mountaineering: { default: 2.2, steps: 1 },
+  kayak: { default: 5, river: 6, stream: 5, canal: 5, drain: 4 },
+};
+
+/**
+ * Planning speed for one segment of a given transport mode.
+ * @param {string} modeId
+ * @param {object} tags  OSM tags of the way
+ * @returns {number} km/h
+ */
+function speedKmhFor(modeId, tags) {
+  const table = MODE_SPEEDS_KMH[modeId] || {};
+  const key = (tags && (tags.highway || tags.waterway)) || 'default';
+  let speed = table[key] || table.default || 4.5;
+  if (modeId === 'car' && tags && tags.maxspeed) {
+    const tagged = parseInt(String(tags.maxspeed), 10);
+    if (Number.isFinite(tagged) && tagged > 0) speed = Math.min(130, Math.max(5, tagged));
+  }
+  return speed;
+}
+
+/** Origin for the travel-time budget: current position, else map centre. */
+function getReachOrigin() {
+  if (locationMarker) {
+    const ll = locationMarker.getLatLng();
+    return { lat: ll.lat, lng: ll.lng, label: 'from your location' };
+  }
+  const c = map.getCenter();
+  return { lat: c.lat, lng: c.lng, label: 'from the map centre' };
+}
+
+/** Tiny binary min-heap for Dijkstra. */
+function createMinHeap() {
+  const items = [];
+  return {
+    size: () => items.length,
+    push(value, key) {
+      items.push({ value, key });
+      let i = items.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (items[p].key <= items[i].key) break;
+        const tmp = items[p]; items[p] = items[i]; items[i] = tmp;
+        i = p;
+      }
+    },
+    pop() {
+      const top = items[0];
+      const last = items.pop();
+      if (items.length) {
+        items[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1, r = l + 1;
+          let m = i;
+          if (l < items.length && items[l].key < items[m].key) m = l;
+          if (r < items.length && items[r].key < items[m].key) m = r;
+          if (m === i) break;
+          const tmp = items[i]; items[i] = items[m]; items[m] = tmp;
+          i = m;
+        }
+      }
+      return top;
+    },
+  };
+}
+
+/**
+ * Estimate per-segment travel times from the origin for the selected modes
+ * (Dijkstra over the OSM ways that are already loaded). Returns the fastest
+ * arrival time per segment in seconds; Infinity means not reachable in time.
+ *
+ * @param {Array} segs       reachability segments (meters + lat/lng + tags)
+ * @param {Iterable<string>} modeIds
+ * @param {{lat:number,lng:number}} origin
+ * @param {number} budgetMin
+ * @returns {Float64Array}
+ */
+function computeReachTimes(segs, modeIds, origin, budgetMin) {
+  const n = segs.length;
+  const times = new Float64Array(n);
+  times.fill(Infinity);
+
+  const nodeIds = new Map();
+  const nodeLat = [];
+  const nodeLng = [];
+  const segA = new Int32Array(n);
+  const segB = new Int32Array(n);
+  const nodeKey = (lat, lng) => lat.toFixed(5) + ',' + lng.toFixed(5);
+  const nodeOf = (lat, lng) => {
+    const k = nodeKey(lat, lng);
+    let id = nodeIds.get(k);
+    if (id === undefined) {
+      id = nodeLat.length;
+      nodeIds.set(k, id);
+      nodeLat.push(lat);
+      nodeLng.push(lng);
+    }
+    return id;
+  };
+
+  for (let i = 0; i < n; i++) {
+    segA[i] = nodeOf(segs[i].aLat, segs[i].aLng);
+    segB[i] = nodeOf(segs[i].bLat, segs[i].bLng);
+  }
+
+  const adj = Array.from({ length: nodeLat.length }, () => []);
+  for (let i = 0; i < n; i++) {
+    adj[segA[i]].push(i);
+    adj[segB[i]].push(i);
+  }
+
+  const mLat = 111320;
+  const mLng = 111320 * Math.cos((origin.lat * Math.PI) / 180);
+  let start = 0;
+  let bestD = Infinity;
+  for (let v = 0; v < nodeLat.length; v++) {
+    const dx = (nodeLng[v] - origin.lng) * mLng;
+    const dy = (nodeLat[v] - origin.lat) * mLat;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) { bestD = d; start = v; }
+  }
+
+  const budgetSec = budgetMin * 60;
+
+  for (const modeId of modeIds) {
+    const dist = new Float64Array(nodeLat.length).fill(Infinity);
+    const done = new Uint8Array(nodeLat.length);
+    const heap = createMinHeap();
+    dist[start] = 0;
+    heap.push(start, 0);
+
+    while (heap.size()) {
+      const { value: v, key: dv } = heap.pop();
+      if (done[v] || dv > dist[v]) continue;
+      done[v] = 1;
+      if (dv > budgetSec) continue;
+      for (const si of adj[v]) {
+        const other = segA[si] === v ? segB[si] : segA[si];
+        if (done[other]) continue;
+        const s = segs[si];
+        const len = Math.hypot(s.bx - s.ax, s.by - s.ay);
+        const speed = speedKmhFor(modeId, s.tags);
+        const t = dv + len / (speed / 3.6);
+        if (t < dist[other]) { dist[other] = t; heap.push(other, t); }
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      const t = Math.min(dist[segA[i]], dist[segB[i]]);
+      if (t < times[i]) times[i] = t;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (times[i] > budgetSec) times[i] = Infinity;
+  }
+  return times;
+}
+
+/**
+ * Reachability verdict for an arbitrary map point after an analysis with a
+ * time budget. Empty string when no budget analysis is available.
+ */
+function describeReachabilityAt(lat, lng) {
+  if (!lastReachCtx) return '';
+  const { segs, times, budgetSec, minutes, modesLabel } = lastReachCtx;
+  const mLat = 111320;
+  const mLng = 111320 * Math.cos((lat * Math.PI) / 180);
+  const px = lng * mLng;
+  const py = lat * mLat;
+  let reachable = false;
+  for (let i = 0; i < segs.length; i++) {
+    if (!(times[i] <= budgetSec)) continue;
+    const s = segs[i];
+    if (ptSegDist(px, py, s.ax, s.ay, s.bx, s.by) <= REACHABILITY_DISTANCE_M) {
+      reachable = true;
+      break;
+    }
+  }
+  return reachable
+    ? `⏱️ Reachable within ${minutes} min (${modesLabel})`
+    : `⛔ Not reachable within ${minutes} min (${modesLabel})`;
+}
+
+/** Show which transport/time filter produced the current results. */
+function updateFilterSummary() {
+  const el = document.getElementById('filterSummary');
+  if (!el) return;
+  if (!selectedTransportModes.size) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  const names = [...selectedTransportModes].map((id) => {
+    const m = TRANSPORT_MODES.find((x) => x.id === id);
+    return m ? `${m.icon} ${m.label.replace(/^\S+\s/, '')}` : id;
+  }).join(', ');
+  const time = reachTimeBudgetMin > 0
+    ? ` · max ${reachTimeBudgetMin} min${lastReachCtx ? ' ' + lastReachCtx.originLabel : ''}`
+    : '';
+  el.textContent =
+    `Filter: ${names}${time} · within ${REACHABILITY_DISTANCE_M} m of an accessible route. ` +
+    'Grey areas are outside this filter.';
+  el.classList.remove('hidden');
+}
 /** In-memory log of HTTP/API errors recorded during the session. */
 const errorLog      = [];
 let locationMarker  = null; /* current-position marker */
@@ -1163,6 +1396,8 @@ const analyzeBtn      = document.getElementById('analyzeBtn');
 const statusEl        = document.getElementById('status');
 const opacitySlider   = document.getElementById('opacitySlider');
 const opacityVal      = document.getElementById('opacityVal');
+const reachTimeSlider = document.getElementById('reachTimeSlider');
+const reachTimeVal    = document.getElementById('reachTimeVal');
 const blurSlider      = document.getElementById('blurSlider');
 const blurVal         = document.getElementById('blurVal');
 const weightControls  = document.getElementById('weightControls');
@@ -1613,11 +1848,13 @@ map.on('click', function onMapClick(e) {
   }
 
   const label    = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  const reachStr = describeReachabilityAt(lat, lng);
   const popupHtml =
     `<div class="map-click-popup">` +
     `<b>📍 Selected location</b><br>` +
     `<span class="mcp-coords">${label}</span><br>` +
     `${noiseStr}<br>` +
+    (reachStr ? `${reachStr}<br>` : '') +
     (accessStr ? `${accessStr}<br>` : '') +
     `<button class="popup-nav-btn">🧭 Navigate here</button>` +
     `</div>`;
@@ -2234,12 +2471,28 @@ blurSlider.addEventListener('input', () => {
   if (heatLayer) heatLayer.setOptions({ blur: parseInt(blurSlider.value, 10) });
 });
 
+/* Travel-time budget slider (0 = off) */
+if (reachTimeSlider) {
+  reachTimeSlider.addEventListener('input', () => {
+    reachTimeBudgetMin = parseInt(reachTimeSlider.value, 10) || 0;
+    reachTimeVal.textContent = reachTimeBudgetMin > 0 ? `${reachTimeBudgetMin} min` : 'off';
+    /* Existing overlay is stale until the next analysis. */
+    if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+    lastReachCtx = null;
+    updateFilterSummary();
+  });
+}
+
 /* ── Analyze button ──────────────────────────────────────────────── */
 analyzeBtn.addEventListener('click', runAnalysis);
 if (clearResultsBtn) clearResultsBtn.addEventListener('click', clearResults);
 
 async function runAnalysis() {
   if (analyzing) return;
+  if (reachTimeBudgetMin > 0 && selectedTransportModes.size === 0) {
+    showStatus('Choose at least one transportation mode to use the travel-time budget.', 'error');
+    return;
+  }
   analyzing = true;
   analyzeBtn.disabled = true;
   /* On mobile, close the sidebar so the map is fully visible */
@@ -2311,6 +2564,7 @@ async function runAnalysis() {
       terrainLegendEl.classList.add('hidden');
     }
     renderResults(quietestPoints, bounds);
+    updateFilterSummary();
 
     const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
       ? ` ${unreachablePoints.length} area(s) greyed out (unreachable).`
@@ -2812,6 +3066,9 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
           ay: geom[i].lat   * mPerLat,
           bx: geom[i+1].lon * mPerLng,
           by: geom[i+1].lat * mPerLat,
+          aLat: geom[i].lat, aLng: geom[i].lon,
+          bLat: geom[i+1].lat, bLng: geom[i+1].lon,
+          tags: way.tags || {},
         });
       }
     }
@@ -2827,6 +3084,9 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
             ay: geom[i].lat   * mPerLat,
             bx: geom[i+1].lon * mPerLng,
             by: geom[i+1].lat * mPerLat,
+            aLat: geom[i].lat, aLng: geom[i].lon,
+            bLat: geom[i+1].lat, bLng: geom[i+1].lon,
+            tags: Object.assign({ highway: 'path' }, way.tags || {}),
           });
         }
       }
@@ -2843,10 +3103,32 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
             ay: geom[i].lat   * mPerLat,
             bx: geom[i+1].lon * mPerLng,
             by: geom[i+1].lat * mPerLat,
+            aLat: geom[i].lat, aLng: geom[i].lon,
+            bLat: geom[i+1].lat, bLng: geom[i+1].lon,
+            tags: way.tags || {},
           });
         }
       }
     }
+  }
+
+  /* Travel-time budget: keep only segments reachable within N minutes. */
+  let reachTimes = null;
+  lastReachCtx = null;
+  if (filterByReachability && reachTimeBudgetMin > 0 && reachSegments.length) {
+    const origin = getReachOrigin();
+    reachTimes = computeReachTimes(reachSegments, selectedTransportModes, origin, reachTimeBudgetMin);
+    const modeNames = [...selectedTransportModes]
+      .map((id) => (TRANSPORT_MODES.find((m) => m.id === id) || {}).label || id)
+      .join(' / ');
+    lastReachCtx = {
+      segs: reachSegments,
+      times: reachTimes,
+      budgetSec: reachTimeBudgetMin * 60,
+      minutes: reachTimeBudgetMin,
+      modesLabel: modeNames,
+      originLabel: origin.label,
+    };
   }
 
   /* Score every grid point */
@@ -2867,7 +3149,9 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
        * ──────────────────────────────────────────────────────────────── */
       if (filterByReachability) {
         let reachable = false;
-        for (const seg of reachSegments) {
+        for (let k = 0; k < reachSegments.length; k++) {
+          if (reachTimes && !(reachTimes[k] <= reachTimeBudgetMin * 60)) continue;
+          const seg = reachSegments[k];
           if (ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by) <= REACHABILITY_DISTANCE_M) {
             reachable = true;
             break;
@@ -3308,11 +3592,16 @@ function clearResults() {
   if (mapClickMarker) { map.removeLayer(mapClickMarker); mapClickMarker = null; }
 
   lastAnalysisBounds = null;
+  lastReachCtx = null;
   resultsList.innerHTML = '';
   resultsCard.classList.add('hidden');
   terrainLegendEl.classList.add('hidden');
   const statusEl = document.getElementById('status');
   if (statusEl) statusEl.classList.add('hidden');
+  updateFilterSummary();
+  /* No results on screen - the filter summary would be misleading. */
+  const filterEl = document.getElementById('filterSummary');
+  if (filterEl) { filterEl.classList.add('hidden'); filterEl.textContent = ''; }
   updateHistoryHint();
 }
 

@@ -83,9 +83,15 @@
           Select how you travel to determine which areas are reachable.
           Spots more than 200 m from any accessible route will be greyed out
           on the map and excluded from the quietest-spots list.
-          Select multiple modes to combine reachability.
+          Select multiple modes to combine reachability. Set a max travel time to keep only the area you can reach from here in time.
         </p>
         <div id="transportModes" class="transport-modes-grid"></div>
+        <label class="slider-label" for="reachTimeSlider"
+               title="Only keep areas reachable within this time from your current position (or the map centre)">
+          Max travel time
+          <input type="range" id="reachTimeSlider" min="0" max="60" step="5" value="0" />
+          <span id="reachTimeVal">off</span>
+        </label>
       </section>
 
       <!-- Analyze -->
@@ -179,6 +185,7 @@
       <!-- Results -->
       <section class="card hidden" id="resultsCard">
         <h2>🏆 Quietest Spots</h2>
+        <p id="filterSummary" class="hint hidden"></p>
         <ol id="resultsList"></ol>
         <p id="resultsHistoryHint" class="hint hidden"></p>
       </section>
