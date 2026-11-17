@@ -522,86 +522,134 @@ function createMinHeap() {
  * @param {number} budgetMin
  * @returns {Float64Array}
  */
-function computeReachTimes(segs, modeIds, origin, budgetMin) {
-  const n = segs.length;
-  const times = new Float64Array(n);
-  times.fill(Infinity);
+/** True when a way may be used by the given transportation mode. */
+function modeAllows(mode, tags) {
+  if (!tags) return false;
+  if (mode.needsWaterways) return !!tags.waterway;
+  if (!tags.highway) return false;
+  return mode.accessibleHighways.has(tags.highway);
+}
 
-  const nodeIds = new Map();
-  const nodeLat = [];
-  const nodeLng = [];
-  const segA = new Int32Array(n);
-  const segB = new Int32Array(n);
-  const nodeKey = (lat, lng) => lat.toFixed(5) + ',' + lng.toFixed(5);
-  const nodeOf = (lat, lng) => {
-    const k = nodeKey(lat, lng);
-    let id = nodeIds.get(k);
-    if (id === undefined) {
-      id = nodeLat.length;
-      nodeIds.set(k, id);
-      nodeLat.push(lat);
-      nodeLng.push(lng);
-    }
-    return id;
-  };
+/**
+ * Travel times (seconds) per segment from the origin, fastest over all
+ * selected modes. Infinity = not reachable within the budget.
+ *
+ * Nodes are keyed by (way, vertex), so vertices of the same way never
+ * collapse. Only way *endpoints* may join a vertex of a different way within
+ * SNAP_M metres: that connects junctions and tile-clipped ends without
+ * merging parallel roads into a single point.
+ */
+/** Effective planning speed per mode (km/h, includes stops and detours). */
+const MODE_EFFECTIVE_KMH = {
+  car: 45, bike: 15, foot: 4.5, climbing: 3, mountaineering: 2.2, kayak: 5,
+};
 
-  for (let i = 0; i < n; i++) {
-    segA[i] = nodeOf(segs[i].aLat, segs[i].aLng);
-    segB[i] = nodeOf(segs[i].bLat, segs[i].bLng);
-  }
+/** Extra distance factor for real routes vs. straight lines. */
+const REACH_DETOUR_FACTOR = 1.3;
 
-  const adj = Array.from({ length: nodeLat.length }, () => []);
-  for (let i = 0; i < n; i++) {
-    adj[segA[i]].push(i);
-    adj[segB[i]].push(i);
-  }
-
+/**
+ * Build the travel-time context for the reachability filter.
+ *
+ * Time budget = straight-line radius per mode (effective speed x budget /
+ * detour factor), intersected with "within REACHABILITY_DISTANCE_M of a route
+ * the mode can use". Segments are indexed in a coarse grid so the per-point
+ * check stays cheap. This is deliberately simple and robust: tile geometry has
+ * no reliable topology, and a coordinate-based road graph fragments into
+ * hundreds of isolated pieces, which made the radius look wrong.
+ *
+ * @param {L.LatLngBounds} bounds
+ * @param {Array} segs
+ * @param {Iterable<string>} modeIds
+ * @param {{lat:number,lng:number,label:string}} origin
+ * @param {number} budgetMin
+ */
+function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
   const mLat = 111320;
   const mLng = 111320 * Math.cos((origin.lat * Math.PI) / 180);
-  let start = 0;
-  let bestD = Infinity;
-  for (let v = 0; v < nodeLat.length; v++) {
-    const dx = (nodeLng[v] - origin.lng) * mLng;
-    const dy = (nodeLat[v] - origin.lat) * mLat;
-    const d = dx * dx + dy * dy;
-    if (d < bestD) { bestD = d; start = v; }
-  }
+  const CELL_M = 300;
+  const perMode = [];
 
-  const budgetSec = budgetMin * 60;
+  for (const id of modeIds) {
+    const mode = TRANSPORT_MODES.find((m) => m.id === id);
+    if (!mode) continue;
+    const usable = segs.filter((s) => modeAllows(mode, s.tags));
+    if (!usable.length) continue;
 
-  for (const modeId of modeIds) {
-    const dist = new Float64Array(nodeLat.length).fill(Infinity);
-    const done = new Uint8Array(nodeLat.length);
-    const heap = createMinHeap();
-    dist[start] = 0;
-    heap.push(start, 0);
-
-    while (heap.size()) {
-      const { value: v, key: dv } = heap.pop();
-      if (done[v] || dv > dist[v]) continue;
-      done[v] = 1;
-      if (dv > budgetSec) continue;
-      for (const si of adj[v]) {
-        const other = segA[si] === v ? segB[si] : segA[si];
-        if (done[other]) continue;
-        const s = segs[si];
-        const len = Math.hypot(s.bx - s.ax, s.by - s.ay);
-        const speed = speedKmhFor(modeId, s.tags);
-        const t = dv + len / (speed / 3.6);
-        if (t < dist[other]) { dist[other] = t; heap.push(other, t); }
+    const index = new Map();
+    for (const s of usable) {
+      const minX = Math.min(s.ax, s.bx);
+      const maxX = Math.max(s.ax, s.bx);
+      const minY = Math.min(s.ay, s.by);
+      const maxY = Math.max(s.ay, s.by);
+      const bx0 = Math.floor(minX / CELL_M);
+      const bx1 = Math.floor(maxX / CELL_M);
+      const by0 = Math.floor(minY / CELL_M);
+      const by1 = Math.floor(maxY / CELL_M);
+      for (let bx = bx0; bx <= bx1; bx++) {
+        for (let by = by0; by <= by1; by++) {
+          const key = `${bx},${by}`;
+          let list = index.get(key);
+          if (!list) { list = []; index.set(key, list); }
+          list.push(s);
+        }
       }
     }
 
-    for (let i = 0; i < n; i++) {
-      const t = Math.min(dist[segA[i]], dist[segB[i]]);
-      if (t < times[i]) times[i] = t;
-    }
+    const speed = MODE_EFFECTIVE_KMH[mode.id] || 4.5;
+    const radiusM = (speed * 1000 / 60) * budgetMin / REACH_DETOUR_FACTOR;
+
+    perMode.push({ mode, index, radiusM });
   }
 
-  for (let i = 0; i < n; i++) {
-    if (times[i] > budgetSec) times[i] = Infinity;
+  return {
+    bounds,
+    origin,
+    mLat,
+    mLng,
+    cellM: CELL_M,
+    minutes: budgetMin,
+    modesLabel: perMode.length
+      ? perMode.map((p) => p.mode.label).join(' / ')
+      : [...modeIds].join(', '),
+    originLabel: origin.label,
+    perMode,
+  };
+}
+
+/**
+ * True when the point is reachable: inside the mode radius AND close to a
+ * route that mode may use. Modes are OR-combined.
+ */
+function reachContextAllows(ctx, lat, lng) {
+  if (!ctx) return true;
+  const px = lng * ctx.mLng;
+  const py = lat * ctx.mLat;
+  const ox = ctx.origin.lng * ctx.mLng;
+  const oy = ctx.origin.lat * ctx.mLat;
+
+  for (const entry of ctx.perMode) {
+    const dx = px - ox;
+    const dy = py - oy;
+    if (dx * dx + dy * dy > entry.radiusM * entry.radiusM) continue;
+
+    const bx = Math.floor(px / ctx.cellM);
+    const by = Math.floor(py / ctx.cellM);
+    let near = false;
+    for (let gx = -1; gx <= 1 && !near; gx++) {
+      for (let gy = -1; gy <= 1 && !near; gy++) {
+        const list = entry.index.get(`${bx + gx},${by + gy}`);
+        if (!list) continue;
+        for (const s of list) {
+          if (ptSegDist(px, py, s.ax, s.ay, s.bx, s.by) <= REACHABILITY_DISTANCE_M) {
+            near = true;
+            break;
+          }
+        }
+      }
+    }
+    if (near) return true;
   }
-  return times;
+  return false;
 }
 
 /**
@@ -610,25 +658,13 @@ function computeReachTimes(segs, modeIds, origin, budgetMin) {
  */
 function describeReachabilityAt(lat, lng) {
   if (!lastReachCtx) return '';
-  const { segs, times, budgetSec, minutes, modesLabel } = lastReachCtx;
-  const mLat = 111320;
-  const mLng = 111320 * Math.cos((lat * Math.PI) / 180);
-  const px = lng * mLng;
-  const py = lat * mLat;
-  let reachable = false;
-  for (let i = 0; i < segs.length; i++) {
-    if (!(times[i] <= budgetSec)) continue;
-    const s = segs[i];
-    if (ptSegDist(px, py, s.ax, s.ay, s.bx, s.by) <= REACHABILITY_DISTANCE_M) {
-      reachable = true;
-      break;
-    }
-  }
-  return reachable
+  const ok = reachContextAllows(lastReachCtx, lat, lng);
+  const minutes = lastReachCtx.minutes;
+  const modesLabel = lastReachCtx.modesLabel;
+  return ok
     ? `⏱️ Reachable within ${minutes} min (${modesLabel})`
     : `⛔ Not reachable within ${minutes} min (${modesLabel})`;
 }
-
 /** Show which transport/time filter produced the current results. */
 function updateFilterSummary() {
   const el = document.getElementById('filterSummary');
@@ -3054,8 +3090,11 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
       if (mode.needsWaterways)      includeWaterways    = true;
     }
 
+    let reachWaySeq = 0;
+
     /* Road segments accessible by the selected modes */
     for (const way of ways) {
+      const w = ++reachWaySeq;
       const highway = way.tags && way.tags.highway;
       if (!highway || !accessibleHighways.has(highway)) continue;
       const geom = way.geometry;
@@ -3066,7 +3105,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
           ay: geom[i].lat   * mPerLat,
           bx: geom[i+1].lon * mPerLng,
           by: geom[i+1].lat * mPerLat,
-          aLat: geom[i].lat, aLng: geom[i].lon,
+          w, k: i, aLat: geom[i].lat, aLng: geom[i].lon,
           bLat: geom[i+1].lat, bLng: geom[i+1].lon,
           tags: way.tags || {},
         });
@@ -3076,6 +3115,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     /* Terrain paths for climbing / mountaineering */
     if (includeTerrainPaths) {
       for (const way of reachTerrainWays) {
+        const w = ++reachWaySeq;
         const geom = way.geometry;
         if (!geom || geom.length < 2) continue;
         for (let i = 0; i < geom.length - 1; i++) {
@@ -3084,7 +3124,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
             ay: geom[i].lat   * mPerLat,
             bx: geom[i+1].lon * mPerLng,
             by: geom[i+1].lat * mPerLat,
-            aLat: geom[i].lat, aLng: geom[i].lon,
+            w, k: i, aLat: geom[i].lat, aLng: geom[i].lon,
             bLat: geom[i+1].lat, bLng: geom[i+1].lon,
             tags: Object.assign({ highway: 'path' }, way.tags || {}),
           });
@@ -3095,6 +3135,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     /* Waterways for kayaking / canoeing */
     if (includeWaterways) {
       for (const way of waterwayWays) {
+        const w = ++reachWaySeq;
         const geom = way.geometry;
         if (!geom || geom.length < 2) continue;
         for (let i = 0; i < geom.length - 1; i++) {
@@ -3103,32 +3144,19 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
             ay: geom[i].lat   * mPerLat,
             bx: geom[i+1].lon * mPerLng,
             by: geom[i+1].lat * mPerLat,
-            aLat: geom[i].lat, aLng: geom[i].lon,
+            w, k: i, aLat: geom[i].lat, aLng: geom[i].lon,
             bLat: geom[i+1].lat, bLng: geom[i+1].lon,
             tags: way.tags || {},
           });
-        }
       }
     }
   }
+  }
 
   /* Travel-time budget: keep only segments reachable within N minutes. */
-  let reachTimes = null;
   lastReachCtx = null;
   if (filterByReachability && reachTimeBudgetMin > 0 && reachSegments.length) {
-    const origin = getReachOrigin();
-    reachTimes = computeReachTimes(reachSegments, selectedTransportModes, origin, reachTimeBudgetMin);
-    const modeNames = [...selectedTransportModes]
-      .map((id) => (TRANSPORT_MODES.find((m) => m.id === id) || {}).label || id)
-      .join(' / ');
-    lastReachCtx = {
-      segs: reachSegments,
-      times: reachTimes,
-      budgetSec: reachTimeBudgetMin * 60,
-      minutes: reachTimeBudgetMin,
-      modesLabel: modeNames,
-      originLabel: origin.label,
-    };
+    lastReachCtx = buildReachContext(bounds, reachSegments, selectedTransportModes, getReachOrigin(), reachTimeBudgetMin);
   }
 
   /* Score every grid point */
@@ -3148,13 +3176,17 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
        * further than REACHABILITY_DISTANCE_M metres away.              *
        * ──────────────────────────────────────────────────────────────── */
       if (filterByReachability) {
-        let reachable = false;
-        for (let k = 0; k < reachSegments.length; k++) {
-          if (reachTimes && !(reachTimes[k] <= reachTimeBudgetMin * 60)) continue;
-          const seg = reachSegments[k];
-          if (ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by) <= REACHABILITY_DISTANCE_M) {
-            reachable = true;
-            break;
+        let reachable;
+        if (lastReachCtx) {
+          reachable = reachContextAllows(lastReachCtx, lat, lng);
+        } else {
+          reachable = false;
+          for (let k = 0; k < reachSegments.length; k++) {
+            const seg = reachSegments[k];
+            if (ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by) <= REACHABILITY_DISTANCE_M) {
+              reachable = true;
+              break;
+            }
           }
         }
         if (!reachable) {

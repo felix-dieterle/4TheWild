@@ -12,7 +12,7 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 | ⚖️ Adjustable road weights | Tune how much each road type contributes to noise |
 | 🎚 Heatmap controls | Opacity and blur radius sliders |
 | ?? Transportation filters | Car, bike, on foot, climbing, mountaineering, kayaking - reachable within 200 m of an accessible route |
-| ?? Travel-time budget | 5-60 min from your location (or the map centre), computed on the loaded OSM ways |
+| ?? Travel-time budget | 5-60 min from your location (or the map centre), effective-speed radius intersected with accessible routes |
 | ?? Filter feedback | Active filter summary, grey-out legend and reachable/not-reachable in the map-click popup |
 
 ## How it works
