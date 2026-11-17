@@ -271,6 +271,7 @@ const TRANSPORT_MODES = [
     label: '🚗 Auto (Car)',
     icon:  '🚗',
     description: 'Reachable by car: motorways, main roads and service roads only.',
+    navProfile: 'driving',
     accessibleHighways: new Set([
       'motorway', 'motorway_link', 'trunk', 'trunk_link',
       'primary', 'primary_link', 'secondary', 'secondary_link',
@@ -281,10 +282,26 @@ const TRANSPORT_MODES = [
     includeTerrainPaths: false,
   },
   {
+    id: 'bike',
+    label: '🚲 Fahrrad (Bike)',
+    icon:  '🚲',
+    description: 'Reachable by bicycle: roads, cycleways, tracks and most paths (pushing a bike included).',
+    navProfile: 'cycling',
+    accessibleHighways: new Set([
+      'primary', 'primary_link', 'secondary', 'secondary_link',
+      'tertiary', 'tertiary_link', 'residential', 'living_street',
+      'unclassified', 'service', 'track', 'path', 'footway',
+      'cycleway', 'pedestrian',
+    ]),
+    needsWaterways:    false,
+    includeTerrainPaths: false,
+  },
+  {
     id: 'foot',
     label: '🚶 Zu Fuß (On foot)',
     icon:  '🚶',
     description: 'Reachable on foot: roads with footways or roadsides, plus walking paths, footways and steps.',
+    navProfile: 'foot',
     accessibleHighways: new Set([
       'primary', 'primary_link', 'secondary', 'secondary_link',
       'tertiary', 'tertiary_link', 'residential', 'living_street',
@@ -1207,8 +1224,34 @@ document.querySelectorAll('.nav-mode-btn').forEach(btn => {
     document.querySelectorAll('.nav-mode-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     navMode = btn.dataset.mode;
+    /* Keep the reachability filter in sync: one routing mode = one filter mode. */
+    const transportId = NAV_TO_TRANSPORT[navMode];
+    if (transportId) {
+      selectedTransportModes = new Set([transportId]);
+      syncTransportCheckboxes();
+      if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+    }
   });
 });
+
+/** Map an OSRM routing profile to the matching transportation filter id. */
+const NAV_TO_TRANSPORT = { driving: 'car', cycling: 'bike', foot: 'foot' };
+/** Map a transportation filter id to its OSRM routing profile. */
+const TRANSPORT_TO_NAV = { car: 'driving', bike: 'cycling', foot: 'foot' };
+
+/** Reflect `selectedTransportModes` in the checkbox UI. */
+function syncTransportCheckboxes() {
+  document.querySelectorAll('#transportModes input[type="checkbox"]').forEach((cb) => {
+    cb.checked = selectedTransportModes.has(cb.value);
+  });
+}
+
+/** Reflect the routing mode in the nav buttons (no click handlers fired). */
+function syncNavButtons() {
+  document.querySelectorAll('.nav-mode-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.mode === navMode);
+  });
+}
 
 /**
  * Display a message in the navigation status area.
@@ -2150,6 +2193,11 @@ function buildTransportUI() {
         selectedTransportModes.add(mode.id);
       } else {
         selectedTransportModes.delete(mode.id);
+      }
+      /* A single selected mode also sets the navigation profile. */
+      if (selectedTransportModes.size === 1 && mode.navProfile) {
+        navMode = mode.navProfile;
+        syncNavButtons();
       }
       /* Clear the unreachable overlay immediately when modes change so it
        * does not stay stale until the next analysis run.               */
