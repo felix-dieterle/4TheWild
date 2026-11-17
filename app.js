@@ -265,6 +265,14 @@ const RAILWAY_UI_GROUPS = [
  * ──────────────────────────────────────────────────────────────────── */
 const REACHABILITY_DISTANCE_M = 200; /* metres from nearest accessible route */
 
+/**
+ * Minimum map zoom for the reachability filter. Below this level the
+ * OpenFreeMap/OpenMapTiles tiles only carry motorways, trunk and primary
+ * roads, so "within 200 m of an accessible route" would grey out nearly the
+ * whole viewport and the travel-time radius would look wrong.
+ */
+const MIN_REACH_ZOOM = 12;
+
 const TRANSPORT_MODES = [
   {
     id: 'car',
@@ -421,6 +429,8 @@ let reachTimeBudgetMin = 0;
 let lastReachCtx = null;
 /** Canvas imageOverlay for greying out unreachable grid cells. */
 let unreachableOverlay = null;
+/** Dashed circles showing the straight-line travel-time radius per mode. */
+let reachRadiusOverlay = null;
 
 /**
  * Average speeds (km/h) per mode and OSM way type. Used for the travel-time
@@ -596,7 +606,11 @@ function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
     }
 
     const speed = MODE_EFFECTIVE_KMH[mode.id] || 4.5;
-    const radiusM = (speed * 1000 / 60) * budgetMin / REACH_DETOUR_FACTOR;
+    /* budgetMin = 0 means "no time limit": the radius is unbounded and only
+     * the distance-to-route rule applies. */
+    const radiusM = budgetMin > 0
+      ? (speed * 1000 / 60) * budgetMin / REACH_DETOUR_FACTOR
+      : Infinity;
 
     perMode.push({ mode, index, radiusM });
   }
@@ -622,6 +636,10 @@ function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
  */
 function reachContextAllows(ctx, lat, lng) {
   if (!ctx) return true;
+  /* No usable route data for any selected mode (typically because the view is
+   * zoomed out far enough that the tiles only carry major roads): we cannot
+   * judge reachability, so do not grey the area out. */
+  if (!ctx.perMode.length) return true;
   const px = lng * ctx.mLng;
   const py = lat * ctx.mLat;
   const ox = ctx.origin.lng * ctx.mLng;
@@ -662,8 +680,8 @@ function describeReachabilityAt(lat, lng) {
   const minutes = lastReachCtx.minutes;
   const modesLabel = lastReachCtx.modesLabel;
   return ok
-    ? `⏱️ Reachable within ${minutes} min (${modesLabel})`
-    : `⛔ Not reachable within ${minutes} min (${modesLabel})`;
+    ? `⏱️ Reachable within ${minutes} min straight-line radius (${modesLabel})`
+    : `⛔ Not reachable within ${minutes} min straight-line radius (${modesLabel})`;
 }
 /** Show which transport/time filter produced the current results. */
 function updateFilterSummary() {
@@ -678,12 +696,24 @@ function updateFilterSummary() {
     const m = TRANSPORT_MODES.find((x) => x.id === id);
     return m ? `${m.icon} ${m.label.replace(/^\S+\s/, '')}` : id;
   }).join(', ');
-  const time = reachTimeBudgetMin > 0
-    ? ` · max ${reachTimeBudgetMin} min${lastReachCtx ? ' ' + lastReachCtx.originLabel : ''}`
+  let time = '';
+  if (reachTimeBudgetMin > 0) {
+    /* Show the resulting radius so the time budget is not mistaken for a
+     * route length: it is a straight-line radius per mode (fastest mode wins). */
+    const radiiKm = [...selectedTransportModes].map((id) =>
+      ((MODE_EFFECTIVE_KMH[id] || 4.5) * reachTimeBudgetMin) / 60 / REACH_DETOUR_FACTOR
+    );
+    const maxKm = radiiKm.length ? Math.max(...radiiKm) : 0;
+    const radiusText = maxKm >= 1 ? `${maxKm.toFixed(1)} km` : `${Math.round(maxKm * 1000)} m`;
+    time = ` · max ${reachTimeBudgetMin} min ≈ ${radiusText} straight-line` +
+      (lastReachCtx ? ' ' + lastReachCtx.originLabel : '');
+  }
+  const zoomPaused = map.getZoom() < MIN_REACH_ZOOM
+    ? ` Paused at this zoom level: zoom in to ${MIN_REACH_ZOOM}+ (only major roads are loaded here).`
     : '';
   el.textContent =
     `Filter: ${names}${time} · within ${REACHABILITY_DISTANCE_M} m of an accessible route. ` +
-    'Grey areas are outside this filter.';
+    'Grey areas are outside this filter.' + zoomPaused;
   el.classList.remove('hidden');
 }
 /** In-memory log of HTTP/API errors recorded during the session. */
@@ -2478,6 +2508,11 @@ function buildTransportUI() {
         map.removeLayer(unreachableOverlay);
         unreachableOverlay = null;
       }
+      if (reachRadiusOverlay) {
+        map.removeLayer(reachRadiusOverlay);
+        reachRadiusOverlay = null;
+      }
+      lastReachCtx = null;
     });
 
     const icon = document.createElement('span');
@@ -2514,6 +2549,7 @@ if (reachTimeSlider) {
     reachTimeVal.textContent = reachTimeBudgetMin > 0 ? `${reachTimeBudgetMin} min` : 'off';
     /* Existing overlay is stale until the next analysis. */
     if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+    if (reachRadiusOverlay) { map.removeLayer(reachRadiusOverlay); reachRadiusOverlay = null; }
     lastReachCtx = null;
     updateFilterSummary();
   });
@@ -2594,6 +2630,7 @@ async function runAnalysis() {
     renderHeatmap(heatPoints);
     renderTripRects(plannedTrips);
     renderUnreachableOverlay(unreachablePoints, bounds);
+    renderReachRadius(lastReachCtx);
     if (useTerrain && terrainWays.length) {
       terrainLegendEl.classList.remove('hidden');
     } else {
@@ -2605,12 +2642,17 @@ async function runAnalysis() {
     const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
       ? ` ${unreachablePoints.length} area(s) greyed out (unreachable).`
       : '';
+    const zoomNote = map.getZoom() < MIN_REACH_ZOOM
+      ? (selectedTransportModes.size > 0
+          ? ` Reachability filter paused: zoom in to level ${MIN_REACH_ZOOM}+ (at this zoom the tiles only contain major roads).`
+          : ` Coarse map data at this zoom: only major roads are included. Zoom in for local streets.`)
+      : '';
     showStatus(
       `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
       (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
       (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : '') +
       (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : '') +
-      reachNote,
+      reachNote + zoomNote,
       'success'
     );
   } catch (err) {
@@ -3074,7 +3116,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
    * selected transport modes.  If no modes are selected, reachability  *
    * filtering is disabled and all grid points are treated as reachable. *
    * ──────────────────────────────────────────────────────────────────── */
-  const filterByReachability = selectedTransportModes.size > 0;
+  const filterByReachability = selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM;
   const reachSegments = [];
 
   if (filterByReachability) {
@@ -3153,11 +3195,16 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
   }
   }
 
-  /* Travel-time budget: keep only segments reachable within N minutes. */
+  /* Reachability context: applies the 200 m route rule and the optional
+   * travel-time budget. It also carries a coarse segment index, which keeps the
+   * per-point check cheap (an unindexed loop was O(grid points x segments)).
+   * `lastReachCtx` is only set when a time budget is active, because only then
+   * a reachable/not-reachable verdict makes sense in the click popup. */
   lastReachCtx = null;
-  if (filterByReachability && reachTimeBudgetMin > 0 && reachSegments.length) {
-    lastReachCtx = buildReachContext(bounds, reachSegments, selectedTransportModes, getReachOrigin(), reachTimeBudgetMin);
-  }
+  const reachCtx = (filterByReachability && reachSegments.length)
+    ? buildReachContext(bounds, reachSegments, selectedTransportModes, getReachOrigin(), reachTimeBudgetMin)
+    : null;
+  if (reachCtx && reachTimeBudgetMin > 0) lastReachCtx = reachCtx;
 
   /* Score every grid point */
   const gridScores      = [];
@@ -3176,19 +3223,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
        * further than REACHABILITY_DISTANCE_M metres away.              *
        * ──────────────────────────────────────────────────────────────── */
       if (filterByReachability) {
-        let reachable;
-        if (lastReachCtx) {
-          reachable = reachContextAllows(lastReachCtx, lat, lng);
-        } else {
-          reachable = false;
-          for (let k = 0; k < reachSegments.length; k++) {
-            const seg = reachSegments[k];
-            if (ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by) <= REACHABILITY_DISTANCE_M) {
-              reachable = true;
-              break;
-            }
-          }
-        }
+        const reachable = reachContextAllows(reachCtx, lat, lng);
         if (!reachable) {
           unreachablePoints.push({ lat, lng });
           continue;
@@ -3617,6 +3652,7 @@ function clearResults() {
 
   if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
   if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+  if (reachRadiusOverlay) { map.removeLayer(reachRadiusOverlay); reachRadiusOverlay = null; }
   if (vegetationLayer) { map.removeLayer(vegetationLayer); vegetationLayer = null; }
   if (terrainLayer) { map.removeLayer(terrainLayer); terrainLayer = null; }
   tripRects.forEach((r) => map.removeLayer(r));
@@ -3765,6 +3801,63 @@ function renderUnreachableOverlay(unreachablePoints, bounds) {
     },
   }]).addTo(map);
 }
+/**
+ * Draw the straight-line travel-time radius per selected mode as dashed
+ * circles plus the origin marker, so the applied time/radius filter is
+ * visible on the map instead of only affecting the grey mask.
+ * @param {object|null} ctx  Reachability context of the last analysis.
+ */
+function renderReachRadius(ctx) {
+  if (reachRadiusOverlay) {
+    map.removeLayer(reachRadiusOverlay);
+    reachRadiusOverlay = null;
+  }
+  if (!ctx || !ctx.perMode || !ctx.perMode.length) return;
+
+  const features = [];
+  const seenRadii = new Set();
+  for (const entry of ctx.perMode) {
+    if (!Number.isFinite(entry.radiusM)) continue;
+    const key = Math.round(entry.radiusM);
+    if (seenRadii.has(key)) continue;
+    seenRadii.add(key);
+    features.push({
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'Polygon',
+        coordinates: [circlePolygon(ctx.origin.lat, ctx.origin.lng, entry.radiusM, 96)],
+      },
+    });
+  }
+  if (!features.length) return;
+
+  features.push({
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Point', coordinates: [ctx.origin.lng, ctx.origin.lat] },
+  });
+
+  reachRadiusOverlay = makeGeoOverlay(features, [{
+    id: 'radius-line',
+    type: 'line',
+    paint: {
+      'line-color': '#f59e0b',
+      'line-width': 1.5,
+      'line-opacity': 0.85,
+    },
+  }, {
+    id: 'radius-origin',
+    type: 'circle',
+    paint: {
+      'circle-radius': 4,
+      'circle-color': '#f59e0b',
+      'circle-stroke-color': '#ffffff',
+      'circle-stroke-width': 1.5,
+    },
+  }]).addTo(map);
+}
+
 function showStatus(msg, type = 'info') {
   statusEl.textContent = msg;
   statusEl.className = `status ${type}`;

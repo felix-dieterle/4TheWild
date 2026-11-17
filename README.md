@@ -13,7 +13,7 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 | 🎚 Heatmap controls | Opacity and blur radius sliders |
 | ?? Transportation filters | Car, bike, on foot, climbing, mountaineering, kayaking - reachable within 200 m of an accessible route |
 | ?? Travel-time budget | 5-60 min from your location (or the map centre), effective-speed radius intersected with accessible routes |
-| ?? Filter feedback | Active filter summary, grey-out legend and reachable/not-reachable in the map-click popup |
+| ?? Filter feedback | Active filter summary, grey-out legend, travel-time radius circle and reachable/not-reachable in the map-click popup |
 
 ## How it works
 
@@ -68,9 +68,12 @@ provider with a usage agreement.
 Open `index.html` in any modern browser (no build step required).  
 Pan & zoom the map to your area of interest, then click **Analyze Current View**.
 
-> **Tip:** Use a zoom level of 10–14 for best results.  
+> **Tip:** Use a zoom level of 12–14 for best results.
 > Analysis works on the tiles that are currently loaded, so zoom in when the
-> current view is very large.
+> current view is very large. Below zoom level 12 the vector tiles only contain
+> major roads, so the reachability/time filter is paused automatically (the
+> status line shows this) and the travel-time radius is drawn as an orange
+> circle once an analysis with a time budget has run.
 
 ## Android APK build
 
