@@ -126,7 +126,28 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
   accent-color: var(--accent2);
   cursor: pointer;
 }
-.slider-label span { min-width: 34px; text-align: right; color: var(--muted); font-size: 0.78rem; }
+.slider-label span {
+  min-width: 44px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.slider-label.is-inactive { opacity: 0.5; }
+.slider-label.is-inactive input[type=range] { accent-color: var(--muted); }
+.slider-label input[type=range]:disabled { cursor: not-allowed; }
+
+/* Current meaning of the travel-time filter (off / active / not effective) */
+.filter-state {
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--muted);
+  margin: 2px 0 4px;
+}
+.filter-state.active { color: var(--accent2); }
+.filter-state.warn   { color: #f59e0b; }
+.filter-state.off    { color: var(--muted); }
+#filterSummary.stale { color: #f59e0b; }
 
 /* ── Legend ─────────────────────────────────────────────────────── */
 .legend {

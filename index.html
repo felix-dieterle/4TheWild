@@ -59,7 +59,8 @@
         <h2>🧭 Navigation</h2>
         <p class="hint">
           Enter a destination and select your travel mode to calculate a route
-          from your current location (or the map centre).
+          from your current location (or the map centre). The selected mode is
+          also used by the reachability filter below.
         </p>
         <input type="text" id="navDestInput" placeholder="Enter destination…" autocomplete="off" />
         <div class="nav-mode-group" role="group" aria-label="Travel mode">
@@ -82,16 +83,17 @@
         <p class="hint">
           Select how you travel to determine which areas are reachable.
           Spots more than 200 m from any accessible route will be greyed out
-          on the map and excluded from the quietest-spots list.
-          Select multiple modes to combine reachability. Set a max travel time to keep only the area you can reach from here in time.
+          on the map (needs zoom level 12 or closer) and excluded from the
+          quietest-spots list. Select multiple modes to combine reachability.
         </p>
         <div id="transportModes" class="transport-modes-grid"></div>
-        <label class="slider-label" for="reachTimeSlider"
-               title="Only keep areas reachable within this time from your current position (or the map centre)">
-          Max travel time
+        <label class="slider-label" id="reachTimeLabel" for="reachTimeSlider"
+               title="Only keep areas within this straight-line travel-time radius from your current position (or the map centre)">
+          Max time
           <input type="range" id="reachTimeSlider" min="0" max="60" step="5" value="0" />
           <span id="reachTimeVal">off</span>
         </label>
+        <div id="timeFilterState" class="filter-state" role="status" aria-live="polite"></div>
       </section>
 
       <!-- Analyze -->

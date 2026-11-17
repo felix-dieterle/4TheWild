@@ -427,6 +427,8 @@ let selectedTransportModes = new Set();
 let reachTimeBudgetMin = 0;
 /** Segment travel times of the last analysis (for click popups). */
 let lastReachCtx = null;
+/** Filter settings ("what was actually considered") of the last analysis. */
+let lastAnalysisInfo = null;
 /** Canvas imageOverlay for greying out unreachable grid cells. */
 let unreachableOverlay = null;
 /** Dashed circles showing the straight-line travel-time radius per mode. */
@@ -557,23 +559,48 @@ const MODE_EFFECTIVE_KMH = {
 /** Extra distance factor for real routes vs. straight lines. */
 const REACH_DETOUR_FACTOR = 1.3;
 
+/** Spatial grid index (CELL_M) over a set of segments. */
+function buildSegmentIndex(segments, cellM) {
+  const index = new Map();
+  for (const s of segments) {
+    const bx0 = Math.floor(Math.min(s.ax, s.bx) / cellM);
+    const bx1 = Math.floor(Math.max(s.ax, s.bx) / cellM);
+    const by0 = Math.floor(Math.min(s.ay, s.by) / cellM);
+    const by1 = Math.floor(Math.max(s.ay, s.by) / cellM);
+    for (let bx = bx0; bx <= bx1; bx++) {
+      for (let by = by0; by <= by1; by++) {
+        const key = `${bx},${by}`;
+        let list = index.get(key);
+        if (!list) { list = []; index.set(key, list); }
+        list.push(s);
+      }
+    }
+  }
+  return index;
+}
+
 /**
  * Build the travel-time context for the reachability filter.
  *
- * Time budget = straight-line radius per mode (effective speed x budget /
- * detour factor), intersected with "within REACHABILITY_DISTANCE_M of a route
- * the mode can use". Segments are indexed in a coarse grid so the per-point
- * check stays cheap. This is deliberately simple and robust: tile geometry has
- * no reliable topology, and a coordinate-based road graph fragments into
- * hundreds of isolated pieces, which made the radius look wrong.
+ * Two independent parts:
+ *  1. Time budget = straight-line radius per mode (effective speed x budget /
+ *     detour factor). Pure geometry, so it works at every zoom level.
+ *  2. Route rule = point must be within REACHABILITY_DISTANCE_M of a way the
+ *     mode can use. Needs detailed tiles, so it only runs when
+ *     `routeRuleActive` is true (zoom >= MIN_REACH_ZOOM).
+ *
+ * The radius is deliberately a circle and not a road graph: tile geometry has
+ * no reliable topology, and a coordinate-based graph fragments into hundreds
+ * of isolated pieces, which made the radius look wrong.
  *
  * @param {L.LatLngBounds} bounds
- * @param {Array} segs
+ * @param {Array} segs               route segments (only used when routeRuleActive)
  * @param {Iterable<string>} modeIds
  * @param {{lat:number,lng:number,label:string}} origin
- * @param {number} budgetMin
+ * @param {number} budgetMin         0 = no time limit
+ * @param {boolean} routeRuleActive
  */
-function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
+function buildReachContext(bounds, segs, modeIds, origin, budgetMin, routeRuleActive) {
   const mLat = 111320;
   const mLng = 111320 * Math.cos((origin.lat * Math.PI) / 180);
   const CELL_M = 300;
@@ -582,35 +609,19 @@ function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
   for (const id of modeIds) {
     const mode = TRANSPORT_MODES.find((m) => m.id === id);
     if (!mode) continue;
-    const usable = segs.filter((s) => modeAllows(mode, s.tags));
-    if (!usable.length) continue;
 
-    const index = new Map();
-    for (const s of usable) {
-      const minX = Math.min(s.ax, s.bx);
-      const maxX = Math.max(s.ax, s.bx);
-      const minY = Math.min(s.ay, s.by);
-      const maxY = Math.max(s.ay, s.by);
-      const bx0 = Math.floor(minX / CELL_M);
-      const bx1 = Math.floor(maxX / CELL_M);
-      const by0 = Math.floor(minY / CELL_M);
-      const by1 = Math.floor(maxY / CELL_M);
-      for (let bx = bx0; bx <= bx1; bx++) {
-        for (let by = by0; by <= by1; by++) {
-          const key = `${bx},${by}`;
-          let list = index.get(key);
-          if (!list) { list = []; index.set(key, list); }
-          list.push(s);
-        }
-      }
-    }
-
+    /* budgetMin = 0 means "no time limit": the radius is unbounded. */
     const speed = MODE_EFFECTIVE_KMH[mode.id] || 4.5;
-    /* budgetMin = 0 means "no time limit": the radius is unbounded and only
-     * the distance-to-route rule applies. */
     const radiusM = budgetMin > 0
       ? (speed * 1000 / 60) * budgetMin / REACH_DETOUR_FACTOR
       : Infinity;
+
+    /* Only build the route index when the route rule is in play. */
+    let index = null;
+    if (routeRuleActive) {
+      const usable = segs.filter((s) => modeAllows(mode, s.tags));
+      if (usable.length) index = buildSegmentIndex(usable, CELL_M);
+    }
 
     perMode.push({ mode, index, radiusM });
   }
@@ -622,6 +633,7 @@ function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
     mLng,
     cellM: CELL_M,
     minutes: budgetMin,
+    routeRuleActive: !!routeRuleActive,
     modesLabel: perMode.length
       ? perMode.map((p) => p.mode.label).join(' / ')
       : [...modeIds].join(', '),
@@ -631,14 +643,12 @@ function buildReachContext(bounds, segs, modeIds, origin, budgetMin) {
 }
 
 /**
- * True when the point is reachable: inside the mode radius AND close to a
- * route that mode may use. Modes are OR-combined.
+ * True when the point is reachable. Modes are OR-combined:
+ *  - inside the mode's time radius, AND
+ *  - (only when the route rule is active) close to a route that mode may use.
  */
 function reachContextAllows(ctx, lat, lng) {
   if (!ctx) return true;
-  /* No usable route data for any selected mode (typically because the view is
-   * zoomed out far enough that the tiles only carry major roads): we cannot
-   * judge reachability, so do not grey the area out. */
   if (!ctx.perMode.length) return true;
   const px = lng * ctx.mLng;
   const py = lat * ctx.mLat;
@@ -649,6 +659,10 @@ function reachContextAllows(ctx, lat, lng) {
     const dx = px - ox;
     const dy = py - oy;
     if (dx * dx + dy * dy > entry.radiusM * entry.radiusM) continue;
+
+    /* Radius-only filtering (route rule paused, or no usable route data for
+     * this mode): being inside the radius is all we can check. */
+    if (!ctx.routeRuleActive || !entry.index) return true;
 
     const bx = Math.floor(px / ctx.cellM);
     const by = Math.floor(py / ctx.cellM);
@@ -679,41 +693,203 @@ function describeReachabilityAt(lat, lng) {
   const ok = reachContextAllows(lastReachCtx, lat, lng);
   const minutes = lastReachCtx.minutes;
   const modesLabel = lastReachCtx.modesLabel;
+  const rule = lastReachCtx.routeRuleActive
+    ? ` and within ${REACHABILITY_DISTANCE_M} m of an accessible route`
+    : '';
+  const where = `within a ${minutes} min straight-line radius${rule}`;
   return ok
-    ? `⏱️ Reachable within ${minutes} min straight-line radius (${modesLabel})`
-    : `⛔ Not reachable within ${minutes} min straight-line radius (${modesLabel})`;
+    ? `⏱️ Reachable ${where} (${modesLabel})`
+    : `⛔ Not reachable ${where} (${modesLabel})`;
 }
-/** Show which transport/time filter produced the current results. */
+/** Selected transport modes with the speed that drives their time radius. */
+function selectedModeSpeeds() {
+  return [...selectedTransportModes].map((id) => {
+    const mode = TRANSPORT_MODES.find((m) => m.id === id);
+    return {
+      id,
+      label: mode ? mode.label : id,
+      speedKmh: MODE_EFFECTIVE_KMH[id] || 4.5,
+    };
+  });
+}
+
+/** Straight-line radius in metres per selected mode for the current budget. */
+function reachRadiiM() {
+  if (!(reachTimeBudgetMin > 0)) return [];
+  return selectedModeSpeeds().map((m) =>
+    (m.speedKmh * 1000 / 60) * reachTimeBudgetMin / REACH_DETOUR_FACTOR);
+}
+
+/** Farthest distance (m) from `origin` to a corner of the map view. */
+function maxViewCornerDistanceM(origin, bounds) {
+  const b = bounds || map.getBounds();
+  const corners = [
+    [b.getSouth(), b.getWest()], [b.getSouth(), b.getEast()],
+    [b.getNorth(), b.getWest()], [b.getNorth(), b.getEast()],
+  ];
+  let max = 0;
+  for (const [lat, lng] of corners) {
+    max = Math.max(max, haversineDistanceM(origin.lat, origin.lng, lat, lng));
+  }
+  return max;
+}
+
+/**
+ * State of the travel-time radius: off | no-mode | active | ineffective.
+ * The radius is plain geometry, so it does not depend on the tile zoom level;
+ * it is only ineffective when it is larger than the current view (then it
+ * cannot grey out anything, and the UI must say so).
+ */
+function getTimeFilterState() {
+  const modeSpeeds = selectedModeSpeeds();
+  const origin = getReachOrigin();
+  const routeRuleActive = selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM;
+  const base = { origin, routeRuleActive, modeSpeeds };
+
+  if (!(reachTimeBudgetMin > 0)) {
+    return Object.assign(base, { state: 'off', radiusM: 0, maxCornerM: 0 });
+  }
+  if (!modeSpeeds.length) {
+    return Object.assign(base, { state: 'no-mode', radiusM: 0, maxCornerM: 0 });
+  }
+
+  const radiusM = Math.max(...reachRadiiM());
+  const maxCornerM = maxViewCornerDistanceM(origin);
+  return Object.assign(base, {
+    state: radiusM < maxCornerM ? 'active' : 'ineffective',
+    radiusM,
+    maxCornerM,
+  });
+}
+
+/** Short distance label, e.g. "5.8 km" / "580 m". */
+function formatRadiusM(m, decimals = 1) {
+  if (!Number.isFinite(m)) return '∞';
+  return m >= 1000 ? `${(m / 1000).toFixed(decimals)} km` : `${Math.round(m / 10) * 10} m`;
+}
+
+/** Human label for the filtered modes, e.g. "🚗 Auto / 🚲 Fahrrad". */
+function modesLabelText(ids) {
+  return ids.map((id) => {
+    const m = TRANSPORT_MODES.find((x) => x.id === id);
+    return m ? m.label : id;
+  }).join(' / ');
+}
+
+/**
+ * Reflect the current filter state in the slider, the state badge and the
+ * radius circle. Called on every input, on map moves and on GPS updates, so
+ * the UI never claims a filter is working when it is not.
+ */
+function updateTimeFilterUI() {
+  const st = getTimeFilterState();
+  const stateEl = document.getElementById('timeFilterState');
+  const labelEl = document.getElementById('reachTimeLabel');
+
+  if (reachTimeVal) {
+    reachTimeVal.textContent = reachTimeBudgetMin > 0 ? `${reachTimeBudgetMin} min` : 'off';
+  }
+  if (reachTimeSlider) {
+    /* Without a transport mode there is no speed, so the slider cannot work. */
+    reachTimeSlider.disabled = selectedTransportModes.size === 0;
+  }
+  if (labelEl) {
+    labelEl.classList.toggle('is-inactive',
+      selectedTransportModes.size === 0 || st.state === 'ineffective');
+  }
+  if (!stateEl) return;
+
+  stateEl.className = 'filter-state';
+  let text = '';
+  if (st.state === 'off') {
+    stateEl.classList.add('off');
+    text = selectedTransportModes.size
+      ? 'Time filter off – no travel-time limit applied.'
+      : 'Reachability filter off – select at least one transport mode.';
+  } else if (st.state === 'no-mode') {
+    stateEl.classList.add('off');
+    text = 'Time filter disabled – select a transport mode first (it defines the speed).';
+  } else {
+    const radius = formatRadiusM(st.radiusM);
+    const origin = st.origin.label;
+    if (st.state === 'active') {
+      stateEl.classList.add('active');
+      text = `Time filter active – ${reachTimeBudgetMin} min ≈ ${radius} straight-line radius ` +
+        `${origin}. Everything outside is greyed out.`;
+    } else {
+      stateEl.classList.add('warn');
+      text = `Time filter not effective – the ${formatRadiusM(st.radiusM, 2)} radius ${origin} is larger ` +
+        `than this view (${formatRadiusM(st.maxCornerM, 2)} to the far corner). ` +
+        'Zoom out or reduce the time.';
+    }
+    if (st.origin.label.indexOf('map centre') !== -1) {
+      text += ' The origin is the map centre and follows the map – enable location for a fixed origin.';
+    }
+  }
+  if (selectedTransportModes.size > 0 && !st.routeRuleActive) {
+    text += ` The 200 m route rule is paused below zoom ${MIN_REACH_ZOOM}.`;
+  }
+  stateEl.textContent = text;
+}
+
+/** Comparable key of an analysis configuration (for the stale check). */
+function analysisSignature(info) {
+  const b = info.bounds;
+  return JSON.stringify({
+    modes: [...info.modes].sort(),
+    budget: info.budgetMin,
+    routeRule: info.routeRuleActive,
+    origin: info.originLabel,
+    bounds: [b.south.toFixed(3), b.west.toFixed(3), b.north.toFixed(3), b.east.toFixed(3)],
+  });
+}
+
+/** Signature of what a fresh analysis would use right now. */
+function currentAnalysisSignature() {
+  const b = map.getBounds();
+  return analysisSignature({
+    modes: [...selectedTransportModes],
+    budgetMin: reachTimeBudgetMin > 0 && selectedTransportModes.size ? reachTimeBudgetMin : 0,
+    routeRuleActive: selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM,
+    originLabel: getReachOrigin().label,
+    bounds: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+  });
+}
+
+/** Describe the filter settings of the LAST analysis and flag stale results. */
 function updateFilterSummary() {
   const el = document.getElementById('filterSummary');
   if (!el) return;
-  if (!selectedTransportModes.size) {
+  if (!lastAnalysisInfo) {
     el.classList.add('hidden');
     el.textContent = '';
     return;
   }
-  const names = [...selectedTransportModes].map((id) => {
-    const m = TRANSPORT_MODES.find((x) => x.id === id);
-    return m ? `${m.icon} ${m.label.replace(/^\S+\s/, '')}` : id;
-  }).join(', ');
-  let time = '';
-  if (reachTimeBudgetMin > 0) {
-    /* Show the resulting radius so the time budget is not mistaken for a
-     * route length: it is a straight-line radius per mode (fastest mode wins). */
-    const radiiKm = [...selectedTransportModes].map((id) =>
-      ((MODE_EFFECTIVE_KMH[id] || 4.5) * reachTimeBudgetMin) / 60 / REACH_DETOUR_FACTOR
-    );
-    const maxKm = radiiKm.length ? Math.max(...radiiKm) : 0;
-    const radiusText = maxKm >= 1 ? `${maxKm.toFixed(1)} km` : `${Math.round(maxKm * 1000)} m`;
-    time = ` · max ${reachTimeBudgetMin} min ≈ ${radiusText} straight-line` +
-      (lastReachCtx ? ' ' + lastReachCtx.originLabel : '');
+
+  const a = lastAnalysisInfo;
+  const parts = [];
+  if (a.modes.length) {
+    parts.push(`reachability ${modesLabelText(a.modes)}`);
+    parts.push(a.routeRuleActive
+      ? `within ${REACHABILITY_DISTANCE_M} m of an accessible route`
+      : `200 m route rule paused (zoom < ${MIN_REACH_ZOOM})`);
+  } else {
+    parts.push('no reachability filter (no transport mode selected)');
   }
-  const zoomPaused = map.getZoom() < MIN_REACH_ZOOM
-    ? ` Paused at this zoom level: zoom in to ${MIN_REACH_ZOOM}+ (only major roads are loaded here).`
-    : '';
-  el.textContent =
-    `Filter: ${names}${time} · within ${REACHABILITY_DISTANCE_M} m of an accessible route. ` +
-    'Grey areas are outside this filter.' + zoomPaused;
+  if (a.budgetMin > 0) {
+    parts.push(`${a.budgetMin} min ≈ ${formatRadiusM(a.radiusM)} straight-line radius ${a.originLabel}` +
+      (a.radiusEffective ? '' : ' (larger than this view – no effect)'));
+  } else {
+    parts.push('time filter off');
+  }
+
+  let text = `Last analysis: ${parts.join(' · ')}.`;
+  if (a.modes.length) text += ' Grey areas are outside this filter.';
+
+  const stale = analysisSignature(a) !== currentAnalysisSignature();
+  el.classList.toggle('stale', stale);
+  if (stale) text += ' ⚠️ Settings or view changed – click Analyze again.';
+  el.textContent = text;
   el.classList.remove('hidden');
 }
 /** In-memory log of HTTP/API errors recorded during the session. */
@@ -1202,6 +1378,10 @@ function placeLocationMarker(lat, lng, accuracy) {
       iconSize: [16, 16], iconAnchor: [8, 8],
     }),
   }).bindPopup('?? Your current location').addTo(map);
+
+  /* The radius origin just changed from "map centre" to "your location". */
+  updateTimeFilterUI();
+  updateFilterSummary();
 }
 
 /**
@@ -1532,6 +1712,10 @@ document.querySelectorAll('.nav-mode-btn').forEach(btn => {
       selectedTransportModes = new Set([transportId]);
       syncTransportCheckboxes();
       if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+      if (reachRadiusOverlay) { map.removeLayer(reachRadiusOverlay); reachRadiusOverlay = null; }
+      lastReachCtx = null;
+      updateTimeFilterUI();
+      updateFilterSummary();
     }
   });
 });
@@ -2514,6 +2698,8 @@ function buildTransportUI() {
         reachRadiusOverlay = null;
       }
       lastReachCtx = null;
+      updateTimeFilterUI();
+      updateFilterSummary();
     });
 
     const icon = document.createElement('span');
@@ -2533,6 +2719,10 @@ function buildTransportUI() {
 }
 
 buildTransportUI();
+syncTransportCheckboxes();
+syncNavButtons();
+updateTimeFilterUI();
+
 opacitySlider.addEventListener('input', () => {
   opacityVal.textContent = Math.round(opacitySlider.value * 100) + '%';
   if (heatLayer) heatLayer.setOptions({ opacity: parseFloat(opacitySlider.value) });
@@ -2547,14 +2737,24 @@ blurSlider.addEventListener('input', () => {
 if (reachTimeSlider) {
   reachTimeSlider.addEventListener('input', () => {
     reachTimeBudgetMin = parseInt(reachTimeSlider.value, 10) || 0;
-    reachTimeVal.textContent = reachTimeBudgetMin > 0 ? `${reachTimeBudgetMin} min` : 'off';
     /* Existing overlay is stale until the next analysis. */
     if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
     if (reachRadiusOverlay) { map.removeLayer(reachRadiusOverlay); reachRadiusOverlay = null; }
     lastReachCtx = null;
+    updateTimeFilterUI();
     updateFilterSummary();
   });
 }
+
+/* Keep the "is the radius doing anything here?" state in sync with the view. */
+let moveUiTimer = null;
+map.on('moveend', () => {
+  if (moveUiTimer) clearTimeout(moveUiTimer);
+  moveUiTimer = setTimeout(() => {
+    updateTimeFilterUI();
+    updateFilterSummary();
+  }, 200);
+});
 
 /* ── Analyze button ──────────────────────────────────────────────── */
 analyzeBtn.addEventListener('click', runAnalysis);
@@ -2562,10 +2762,6 @@ if (clearResultsBtn) clearResultsBtn.addEventListener('click', clearResults);
 
 async function runAnalysis() {
   if (analyzing) return;
-  if (reachTimeBudgetMin > 0 && selectedTransportModes.size === 0) {
-    showStatus('Choose at least one transportation mode to use the travel-time budget.', 'error');
-    return;
-  }
   analyzing = true;
   analyzeBtn.disabled = true;
   /* On mobile, close the sidebar so the map is fully visible */
@@ -2645,7 +2841,8 @@ async function runAnalysis() {
       : '';
     const zoomNote = map.getZoom() < MIN_REACH_ZOOM
       ? (selectedTransportModes.size > 0
-          ? ` Reachability filter paused: zoom in to level ${MIN_REACH_ZOOM}+ (at this zoom the tiles only contain major roads).`
+          ? ` 200 m route rule paused below zoom ${MIN_REACH_ZOOM} (only major roads loaded here)` +
+            (lastReachCtx ? ' – the travel-time radius still applies.' : '.')
           : ` Coarse map data at this zoom: only major roads are included. Zoom in for local streets.`)
       : '';
     showStatus(
@@ -3191,15 +3388,18 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     return { heatPoints: [], quietestPoints: [], unreachablePoints: [] };
   }
 
-  /* ── Build reachability segments ────────────────────────────────── *
-   * Collect all way segments that are accessible given the currently   *
-   * selected transport modes.  If no modes are selected, reachability  *
-   * filtering is disabled and all grid points are treated as reachable. *
+  /* ── What the filter actually consists of ───────────────────────── *
+   * The route rule needs detailed tiles, so it is paused below         *
+   * MIN_REACH_ZOOM. The travel-time radius is plain geometry and keeps  *
+   * working at every zoom level - as long as a transport mode defines   *
+   * the speed.                                                          *
    * ──────────────────────────────────────────────────────────────────── */
-  const filterByReachability = selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM;
+  const routeRuleActive = selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM;
+  const timeFilterActive = reachTimeBudgetMin > 0 && selectedTransportModes.size > 0;
+  const filterByReachability = routeRuleActive || timeFilterActive;
   const reachSegments = [];
 
-  if (filterByReachability) {
+  if (routeRuleActive) {
     const accessibleHighways = new Set();
     let includeTerrainPaths = false;
     let includeWaterways    = false;
@@ -3276,15 +3476,33 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
   }
 
   /* Reachability context: applies the 200 m route rule and the optional
-   * travel-time budget. It also carries a coarse segment index, which keeps the
+   * travel-time radius. It also carries a coarse segment index, which keeps the
    * per-point check cheap (an unindexed loop was O(grid points x segments)).
    * `lastReachCtx` is only set when a time budget is active, because only then
    * a reachable/not-reachable verdict makes sense in the click popup. */
-  lastReachCtx = null;
-  const reachCtx = (filterByReachability && reachSegments.length)
-    ? buildReachContext(bounds, reachSegments, selectedTransportModes, getReachOrigin(), reachTimeBudgetMin)
+  const reachOrigin = getReachOrigin();
+  const reachCtx = filterByReachability
+    ? buildReachContext(bounds, reachSegments, selectedTransportModes, reachOrigin,
+                        reachTimeBudgetMin, routeRuleActive)
     : null;
-  if (reachCtx && reachTimeBudgetMin > 0) lastReachCtx = reachCtx;
+  lastReachCtx = (reachCtx && timeFilterActive) ? reachCtx : null;
+
+  /* Snapshot of what this analysis actually considered (for the honest
+   * summary and the "settings changed" check). */
+  const radii = timeFilterActive ? reachRadiiM() : [];
+  const radiusM = radii.length ? Math.max(...radii) : 0;
+  lastAnalysisInfo = {
+    modes: [...selectedTransportModes],
+    budgetMin: timeFilterActive ? reachTimeBudgetMin : 0,
+    routeRuleActive,
+    originLabel: reachOrigin.label,
+    radiusM,
+    radiusEffective: radiusM > 0 && radiusM < maxViewCornerDistanceM(reachOrigin, bounds),
+    bounds: {
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    },
+  };
 
   /* Score every grid point */
   const gridScores      = [];
@@ -3761,6 +3979,7 @@ function clearResults() {
 
   lastAnalysisBounds = null;
   lastReachCtx = null;
+  lastAnalysisInfo = null;
   resultsList.innerHTML = '';
   resultsCard.classList.add('hidden');
   terrainLegendEl.classList.add('hidden');
@@ -3902,9 +4121,10 @@ function renderUnreachableOverlay(unreachablePoints, bounds) {
   }]).addTo(map);
 }
 /**
- * Draw the straight-line travel-time radius per selected mode as dashed
- * circles plus the origin marker, so the applied time/radius filter is
- * visible on the map instead of only affecting the grey mask.
+ * Draw the straight-line travel-time radius per selected mode as a dashed
+ * circle plus the origin marker, so the applied time/radius filter is visible
+ * on the map instead of only affecting the grey mask. The colour encodes the
+ * state: orange = the radius actually cuts the view, grey = it does not.
  * @param {object|null} ctx  Reachability context of the last analysis.
  */
 function renderReachRadius(ctx) {
@@ -3938,24 +4158,32 @@ function renderReachRadius(ctx) {
     geometry: { type: 'Point', coordinates: [ctx.origin.lng, ctx.origin.lat] },
   });
 
+  const effective = getTimeFilterState().state === 'active';
+  const color = effective ? '#f59e0b' : '#9ca3af';
+
   reachRadiusOverlay = makeGeoOverlay(features, [{
     id: 'radius-line',
     type: 'line',
     paint: {
-      'line-color': '#f59e0b',
+      'line-color': color,
       'line-width': 1.5,
       'line-opacity': 0.85,
+      'line-dasharray': [3, 2],
     },
   }, {
     id: 'radius-origin',
     type: 'circle',
     paint: {
       'circle-radius': 4,
-      'circle-color': '#f59e0b',
+      'circle-color': color,
       'circle-stroke-color': '#ffffff',
       'circle-stroke-width': 1.5,
     },
-  }]).addTo(map);
+  }], {
+    tooltip: effective
+      ? 'Travel-time radius - areas outside are greyed out'
+      : 'Travel-time radius - larger than this view, so it does not limit anything here',
+  }).addTo(map);
 }
 
 function showStatus(msg, type = 'info') {

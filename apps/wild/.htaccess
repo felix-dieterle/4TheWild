@@ -22,3 +22,11 @@ RewriteRule ^ - [L]
 
 # Route /api/* to api.php
 RewriteRule ^api/ api.php [L,QSA]
+
+# The front-end files change on every deploy - always revalidate so a
+# normal reload never serves a stale app.js/style.css.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(html|js|css|json)$">
+    Header set Cache-Control "no-cache, must-revalidate"
+  </FilesMatch>
+</IfModule>
