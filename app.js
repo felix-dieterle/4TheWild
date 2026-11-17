@@ -1468,6 +1468,7 @@ const blurSlider      = document.getElementById('blurSlider');
 const blurVal         = document.getElementById('blurVal');
 const weightControls  = document.getElementById('weightControls');
 const resultsCard     = document.getElementById('resultsCard');
+const resultsTitle    = document.getElementById('resultsTitle');
 const resultsList     = document.getElementById('resultsList');
 const resultsHistoryHint = document.getElementById('resultsHistoryHint');
 const clearResultsBtn = document.getElementById('clearResultsBtn');
@@ -2620,7 +2621,7 @@ async function runAnalysis() {
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
-    const { heatPoints, quietestPoints, unreachablePoints } = computeHeatmap(
+    const { heatPoints, quietestPoints, unreachablePoints, coarseData } = computeHeatmap(
       ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays,
     );
 
@@ -2636,7 +2637,7 @@ async function runAnalysis() {
     } else {
       terrainLegendEl.classList.add('hidden');
     }
-    renderResults(quietestPoints, bounds);
+    renderResults(quietestPoints, bounds, coarseData);
     updateFilterSummary();
 
     const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
@@ -2917,6 +2918,24 @@ async function fetchWaterways(bounds) {
 const GRID_SIZE = 50; /* points per axis - 50x50 = 2 500 sample points */
 /** Minimum distance (m) to avoid division by zero and cap extreme noise near road centrelines. */
 const MIN_DISTANCE_METERS  = 10;
+
+/**
+ * Coarse-data threshold. Below this zoom level the OpenFreeMap/OpenMapTiles
+ * tiles only carry major road classes. The absolute noise index then only
+ * measures the distance to motorways/trunk roads and is systematically worse
+ * than an analysis at detail zoom, so it must not be compared across zooms.
+ */
+const COARSE_DATA_ZOOM = 12;
+
+/**
+ * Sub-cell refinement of the quiet candidates. A 50x50 grid can only place a
+ * sample within half a cell of the true quietest point; when zoomed out that
+ * cell is kilometres wide and inflates the best score. The most promising
+ * cells are therefore re-sampled on a finer sub-grid.
+ */
+const REFINE_CELLS      = 12; /* seed cells re-sampled */
+const REFINE_DIV        = 7;  /* sub-samples per axis (7x7 per cell) */
+const REFINE_MIN_CELL_M = 60; /* refinement is pointless below this cell size */
 /* Speed plausibility bounds for dynamicNoiseFactor().
  * Speeds below MIN_PLAUSIBLE_SPEED_KMH (e.g. a mapped "5" on a cycle path)
  * or above MAX_PLAUSIBLE_SPEED_KMH are clamped to prevent extreme factors
@@ -3042,6 +3061,67 @@ function dynamicRailwayNoiseFactor(railway, tags) {
   const clampedSpeed = Math.min(MAX_TRAIN_SPEED_KMH, Math.max(MIN_PLAUSIBLE_SPEED_KMH, speed));
   const factor = Math.sqrt(clampedSpeed / defaultSpeed);
   return Math.min(MAX_DYNAMIC_NOISE_FACTOR, Math.max(MIN_DYNAMIC_NOISE_FACTOR, factor));
+}
+
+/**
+ * Noise score for a single point.
+ *
+ * noiseScore = max over all segments { weight * 1 000 / distance }
+ *              (* vegetation dampening, + planned-trip penalty)
+ *
+ * The dominant source distance is returned as well, so the UI can explain
+ * where a score comes from (a score of 6 means "the loudest source is X m
+ * away", which is only comparable when the same road classes are loaded).
+ *
+ * @param {number} lat
+ * @param {number} lng
+ * @param {Array<{ax:number,ay:number,bx:number,by:number,weight:number}>} segments
+ * @param {Array} vegetation  polygons with minLat/maxLat/minLon/maxLon/type/geometry
+ * @param {Array<{south:number,north:number,west:number,east:number}>} plannedTrips
+ * @param {number} mPerLat
+ * @param {number} mPerLng
+ * @returns {{noiseScore:number, sourceM:number}} sourceM is Infinity when no segment exists
+ */
+function scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng) {
+  const px = lng * mPerLng;
+  const py = lat * mPerLat;
+  let noiseScore = 0;
+  let sourceM    = Infinity;
+
+  for (const seg of segments) {
+    const dist  = Math.max(MIN_DISTANCE_METERS, ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by));
+    const noise = seg.weight * 1000 / dist;
+    if (noise > noiseScore) {
+      noiseScore = noise;
+      sourceM    = dist;
+    }
+  }
+
+  /* Apply vegetation dampening: points inside a vegetation polygon
+     receive a noise reduction proportional to the vegetation density.
+     The maximum dampening factor across all overlapping polygons is used. */
+  if (vegetation.length && noiseScore > 0) {
+    let maxDamp = 0;
+    for (const vp of vegetation) {
+      if (lat < vp.minLat || lat > vp.maxLat || lng < vp.minLon || lng > vp.maxLon) continue;
+      if (pointInPolygon(lat, lng, vp.geometry)) {
+        const d = VEGETATION_DAMPENING[vp.type] || 0;
+        if (d > maxDamp) maxDamp = d;
+      }
+    }
+    if (maxDamp > 0) noiseScore *= (1 - maxDamp);
+  }
+
+  /* Add a penalty for each planned trip whose bbox covers this point.
+     This reduces the effective silence score of areas that are already
+     planned by other users. */
+  let tripCount = 0;
+  for (const t of plannedTrips) {
+    if (lat >= t.south && lat <= t.north && lng >= t.west && lng <= t.east) tripCount++;
+  }
+  noiseScore += tripCount * TRIP_NOISE_PENALTY;
+
+  return { noiseScore, sourceM };
 }
 
 function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = [], waterwayWays = [], reachTerrainWays = []) {
@@ -3215,67 +3295,75 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     for (let j = 0; j <= GRID_SIZE; j++) {
       const lat = latMin + i * latStep;
       const lng = lngMin + j * lngStep;
-      const px  = lng * mPerLng;
-      const py  = lat * mPerLat;
 
       /* ── Reachability check ─────────────────────────────────────── *
        * Skip (grey out) this point if the nearest accessible route is  *
        * further than REACHABILITY_DISTANCE_M metres away.              *
        * ──────────────────────────────────────────────────────────────── */
-      if (filterByReachability) {
-        const reachable = reachContextAllows(reachCtx, lat, lng);
-        if (!reachable) {
-          unreachablePoints.push({ lat, lng });
-          continue;
-        }
+      if (filterByReachability && !reachContextAllows(reachCtx, lat, lng)) {
+        unreachablePoints.push({ lat, lng });
+        continue;
       }
 
-      let noiseScore = 0;
-      for (const seg of segments) {
-        const dist  = Math.max(MIN_DISTANCE_METERS, ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by));
-        /* noise contribution: weight scaled by a characteristic distance of 1 000 m */
-        const noise = seg.weight * 1000 / dist;
-        if (noise > noiseScore) noiseScore = noise;
-      }
-
-      /* Apply vegetation dampening: points inside a vegetation polygon
-         receive a noise reduction proportional to the vegetation density.
-         The maximum dampening factor across all overlapping polygons is used. */
-      if (vegetation.length) {
-        let maxDamp = 0;
-        for (const vp of vegetation) {
-          if (lat < vp.minLat || lat > vp.maxLat || lng < vp.minLon || lng > vp.maxLon) continue;
-          if (pointInPolygon(lat, lng, vp.geometry)) {
-            const d = VEGETATION_DAMPENING[vp.type] || 0;
-            if (d > maxDamp) maxDamp = d;
-          }
-        }
-        if (maxDamp > 0) noiseScore *= (1 - maxDamp);
-      }
-
-      /* Add a penalty for each planned trip whose bbox covers this point.
-         This reduces the effective silence score of areas that are already
-         planned by other users. */
-      const tripCount = plannedTrips.filter(t =>
-        lat >= t.south && lat <= t.north && lng >= t.west && lng <= t.east
-      ).length;
-      noiseScore += tripCount * TRIP_NOISE_PENALTY;
-
+      const { noiseScore, sourceM } = scoreNoiseAt(
+        lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng,
+      );
       if (noiseScore > maxNoise) maxNoise = noiseScore;
-      gridScores.push({ lat, lng, noiseScore });
+      gridScores.push({ lat, lng, noiseScore, sourceM });
     }
   }
 
-  /* Normalise 0-1 for Leaflet.heat */
+  /* ── Sub-cell refinement of the quietest candidates ───────────────── *
+   * A node of the 50x50 grid can be up to half a cell away from the     *
+   * real quietest point. Zoomed out a cell is kilometres wide, so the   *
+   * coarse grid alone reports a much worse "best" score than a detailed *
+   * analysis. Re-sample the most promising cells on a finer sub-grid.   *
+   * ──────────────────────────────────────────────────────────────────── */
+  const cellM = Math.max(latStep * mPerLat, lngStep * mPerLng);
+  const refined = [];
+  if (gridScores.length && cellM > REFINE_MIN_CELL_M) {
+    const seeds = [...gridScores]
+      .sort((a, b) => a.noiseScore - b.noiseScore)
+      .slice(0, REFINE_CELLS);
+    for (const seed of seeds) {
+      for (let a = 0; a < REFINE_DIV; a++) {
+        for (let b = 0; b < REFINE_DIV; b++) {
+          /* Offsets span -0.5 .. +0.5 cell around the seed node. */
+          const lat = seed.lat + ((a / (REFINE_DIV - 1)) - 0.5) * latStep;
+          const lng = seed.lng + ((b / (REFINE_DIV - 1)) - 0.5) * lngStep;
+          if (lat < latMin || lat > latMax || lng < lngMin || lng > lngMax) continue;
+          if (filterByReachability && !reachContextAllows(reachCtx, lat, lng)) continue;
+          const { noiseScore, sourceM } = scoreNoiseAt(
+            lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng,
+          );
+          refined.push({ lat, lng, noiseScore, sourceM });
+        }
+      }
+    }
+  }
+
+  /* Normalise 0-1 for Leaflet.heat (grid nodes only - refinement would only
+   * sharpen the peak and is irrelevant for the colour ramp). */
   const heatPoints = gridScores.map(({ lat, lng, noiseScore }) => [
     lat, lng, maxNoise > 0 ? noiseScore / maxNoise : 0,
   ]);
 
-  /* Top 5 quietest points (lowest noise score, reachable only) */
-  const sorted = [...gridScores].sort((a, b) => a.noiseScore - b.noiseScore);
-  const quietestPoints = sorted.slice(0, 5);
+  /* Top 5 quietest points (lowest noise score, reachable only). Refined
+   * points are spread out so the list does not fill up with five samples of
+   * the same tiny spot. */
+  const minSepM = Math.max(80, Math.min(cellM, 1000) * 0.5);
+  const sorted = gridScores.concat(refined).sort((a, b) => a.noiseScore - b.noiseScore);
+  const quietestPoints = [];
+  for (const p of sorted) {
+    if (quietestPoints.length >= 5) break;
+    const tooClose = quietestPoints.some(q =>
+      haversineDistanceM(p.lat, p.lng, q.lat, q.lng) < minSepM);
+    if (!tooClose) quietestPoints.push(p);
+  }
 
-  return { heatPoints, quietestPoints, maxNoise, unreachablePoints };
+  const coarseData = map.getZoom() < COARSE_DATA_ZOOM;
+
+  return { heatPoints, quietestPoints, maxNoise, unreachablePoints, coarseData };
 }
 
 /**
@@ -3290,30 +3378,18 @@ function computeNoiseAtPoint(lat, lng) {
   if (!lastNoiseCtx) return null;
   const { segments, mPerLat, mPerLng, vegetation, plannedTrips } = lastNoiseCtx;
   if (!segments.length) return 0;
-  const px = lng * mPerLng;
-  const py = lat * mPerLat;
-  let noiseScore = 0;
-  for (const seg of segments) {
-    const dist  = Math.max(MIN_DISTANCE_METERS, ptSegDist(px, py, seg.ax, seg.ay, seg.bx, seg.by));
-    const noise = seg.weight * 1000 / dist;
-    if (noise > noiseScore) noiseScore = noise;
-  }
-  if (vegetation.length) {
-    let maxDamp = 0;
-    for (const vp of vegetation) {
-      if (lat < vp.minLat || lat > vp.maxLat || lng < vp.minLon || lng > vp.maxLon) continue;
-      if (pointInPolygon(lat, lng, vp.geometry)) {
-        const d = VEGETATION_DAMPENING[vp.type] || 0;
-        if (d > maxDamp) maxDamp = d;
-      }
-    }
-    if (maxDamp > 0) noiseScore *= (1 - maxDamp);
-  }
-  const tripCount = plannedTrips.filter(t =>
-    lat >= t.south && lat <= t.north && lng >= t.west && lng <= t.east
-  ).length;
-  noiseScore += tripCount * TRIP_NOISE_PENALTY;
-  return noiseScore;
+  return scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng).noiseScore;
+}
+
+/**
+ * Short human-readable distance, e.g. "45 m", "1.4 km".
+ * @param {number} m
+ * @returns {string}
+ */
+function formatDistanceM(m) {
+  if (!Number.isFinite(m)) return 'n/a';
+  if (m >= 1000) return `${(m / 1000).toFixed(1)} km`;
+  return `${Math.round(m / 5) * 5} m`;
 }
 
 /**
@@ -3529,10 +3605,11 @@ function updateHistoryHint() {
 
 /**
  * Render the top quiet spots and demote the previous run(s) to faded history.
- * @param {Array<{lat:number,lng:number,noiseScore:number}>} points
+ * @param {Array<{lat:number,lng:number,noiseScore:number,sourceM:number}>} points
  * @param {L.LatLngBounds} [bounds]  analysed view of this run
+ * @param {boolean} [coarseData]     true when only major roads were available
  */
-function renderResults(points, bounds) {
+function renderResults(points, bounds, coarseData = false) {
   /* Demote the current markers to history and fade them one step. */
   if (quietMarkers.length && lastAnalysisBounds) {
     const entry = { markers: quietMarkers, rect: makeGenerationRect(lastAnalysisBounds) };
@@ -3556,6 +3633,12 @@ function renderResults(points, bounds) {
   quietMarkers = [];
   resultsList.innerHTML = '';
 
+  if (resultsTitle) {
+    resultsTitle.textContent = coarseData
+      ? '🏆 Quietest Spots (coarse data)'
+      : '🏆 Quietest Spots';
+  }
+
   if (!points.length) {
     updateHistoryHint();
     if (!quietHistory.length) {
@@ -3572,6 +3655,18 @@ function renderResults(points, bounds) {
 
   resultsCard.classList.remove('hidden');
 
+  if (coarseData) {
+    const hint = document.createElement('li');
+    hint.className = 'result-coarse-hint';
+    hint.textContent =
+      'Coarse map data at this zoom level: the tiles only contain motorways and ' +
+      'major roads. The noise index therefore only measures the distance to those ' +
+      'roads and cannot be compared with a detailed analysis. Zoom in to level ' +
+      `${COARSE_DATA_ZOOM}+ for a meaningful ranking.`;
+    resultsList.appendChild(hint);
+  }
+
+  const scorePrefix = coarseData ? '~' : '';
   points.forEach((p, idx) => {
     /* Map marker */
     const rank = idx + 1;
@@ -3584,12 +3679,15 @@ function renderResults(points, bounds) {
     });
 
     const label = `Quiet spot #${rank}`;
+    const sourceNote = Number.isFinite(p.sourceM)
+      ? ` (loudest source ${formatDistanceM(p.sourceM)} away)`
+      : '';
     const marker = L.marker([p.lat, p.lng], { icon })
       .bindPopup(
         `<div class="map-click-popup">` +
         `<b>${label}</b><br>` +
         `<span class="mcp-coords">${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}</span><br>` +
-        `🔊 Noise index: <b>${p.noiseScore.toFixed(2)}</b><br>` +
+        `🔊 Noise index: <b>${scorePrefix}${p.noiseScore.toFixed(2)}</b>${sourceNote}<br>` +
         `<button class="popup-nav-btn">🧭 Navigate here</button>` +
         `</div>`,
         { maxWidth: 240 }
@@ -3604,7 +3702,9 @@ function renderResults(points, bounds) {
     li.className = 'result-item';
     li.innerHTML =
       `<span class="ri-rank">#${rank}</span>` +
-      `<span class="ri-score">Noise index: ${p.noiseScore.toFixed(2)}</span>` +
+      `<span class="ri-score">Noise index: ${scorePrefix}${p.noiseScore.toFixed(2)}` +
+      (Number.isFinite(p.sourceM) ? ` · nearest source ${formatDistanceM(p.sourceM)}` : '') +
+      `</span>` +
       `<span class="ri-coords">${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}</span>`;
     li.addEventListener('click', () => {
       map.setView([p.lat, p.lng], Math.max(map.getZoom(), 13));

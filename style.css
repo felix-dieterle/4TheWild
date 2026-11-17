@@ -326,6 +326,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
   line-height: 1.5;
   padding: 2px 0;
 }
+.result-coarse-hint {
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--muted);
+  background: rgba(255, 165, 0, 0.12);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
 #resultsHistoryHint { margin-top: 8px; margin-bottom: 0; }
 .maplibregl-marker { transition: opacity 0.15s ease; }
 

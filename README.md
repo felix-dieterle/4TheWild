@@ -28,7 +28,9 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
    where `dist` is the shortest distance from the point to the segment (in metres) and `weight` reflects the road type (motorway = 10, path = 0.2, etc.).
 
 4. Scores are normalised and rendered as a MapLibre heatmap layer.
-5. The five grid points with the **lowest** noise score are shown as ranked markers.
+5. The quietest cells are re-sampled on a finer sub-grid (7×7), because a 50×50 grid can otherwise only place a sample within half a cell of the true quietest point - which inflates the best score noticeably when zoomed out.
+6. The five most promising points, at least a minimum distance apart, are shown as ranked markers, each with the distance to its loudest noise source.
+7. Below zoom level 12 the tiles only contain motorways and major roads, so the absolute index is not comparable with a detailed analysis. Results are then labelled **coarse data**, prefixed with `~` and accompanied by an explicit hint.
 
 ## Road noise weights (defaults)
 
