@@ -96,6 +96,7 @@
           <strong>Analyze</strong> to compute the noise heatmap.
         </p>
         <button id="analyzeBtn">🔍 Analyze Current View</button>
+        <button id="clearResultsBtn" class="secondary" title="Remove the heatmap, all quiet spots and earlier runs">🧹 Clear results</button>
         <div id="status" class="status hidden"></div>
       </section>
 
@@ -179,6 +180,7 @@
       <section class="card hidden" id="resultsCard">
         <h2>🏆 Quietest Spots</h2>
         <ol id="resultsList"></ol>
+        <p id="resultsHistoryHint" class="hint hidden"></p>
       </section>
 
       <footer>

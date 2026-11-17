@@ -320,6 +320,14 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
 .result-item .ri-rank { font-weight: 700; color: var(--accent); margin-right: 4px; }
 .result-item .ri-coords { color: var(--muted); font-size: 0.72rem; display: block; margin-top: 3px; }
 .result-item .ri-score { color: var(--accent2); font-size: 0.72rem; }
+.result-empty-hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.5;
+  padding: 2px 0;
+}
+#resultsHistoryHint { margin-top: 8px; margin-bottom: 0; }
+.maplibregl-marker { transition: opacity 0.15s ease; }
 
 /* Navigate button inside each quiet-spot result item */
 .ri-nav-btn {

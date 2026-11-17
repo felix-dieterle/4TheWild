@@ -387,6 +387,16 @@ let roadWeights     = { ...DEFAULT_ROAD_WEIGHTS };
 let railwayWeights  = { ...DEFAULT_RAILWAY_WEIGHTS };
 let heatLayer       = null;
 let quietMarkers    = [];
+/** Earlier analysis results, newest first: { markers, rect, depth }. */
+let quietHistory    = [];
+/** How many earlier runs stay visible (faded) on the map. */
+const QUIET_HISTORY_MAX = 2;
+/** Bounds of the most recent analysis: { south, west, north, east }. */
+let lastAnalysisBounds = null;
+/** Incremented per completed analysis (used for unique overlay ids). */
+let analysisGeneration = 0;
+/** Only one popup may be open at a time. */
+let activePopup     = null;
 let tripRects       = []; /* Leaflet rectangles for planned trip areas */
 let analyzing       = false;
 /** Set of selected transport mode IDs (empty = no reachability filtering). */
@@ -579,6 +589,30 @@ function whenStyleReady(fn) {
 
 function divIcon(opts) { return opts || {}; }
 
+/**
+ * Enforce a single-popup policy: opening a popup closes whichever popup was
+ * open before, so clicking a quiet spot never stacks two popups.
+ * @param {maplibregl.Popup} pp
+ * @returns {maplibregl.Popup}
+ */
+function activatePopup(pp) {
+  if (activePopup && activePopup !== pp) {
+    try { activePopup.remove(); } catch { /* already gone */ }
+  }
+  activePopup = pp;
+  return pp;
+}
+
+/**
+ * Like activatePopup(), but additionally clears the global reference when the
+ * popup is closed by the user. Call once per popup instance.
+ * @param {maplibregl.Popup} pp
+ */
+function registerPopup(pp) {
+  pp.on('close', () => { if (activePopup === pp) activePopup = null; });
+  return activatePopup(pp);
+}
+
 function latLngBounds(points) {
   const b = new maplibregl.LngLatBounds();
   points.forEach(([lat, lng]) => b.extend([lng, lat]));
@@ -622,11 +656,11 @@ function makeMarker(latlng, opts = {}) {
     openPopup() {
       if (!api._popupHtml) return api;
       api.closePopup();
-      const pp = new maplibregl.Popup({
+      const pp = registerPopup(new maplibregl.Popup({
         maxWidth: ((api._popupOpts && api._popupOpts.maxWidth) || 300) + 'px',
         offset: 12,
         closeButton: true,
-      }).setLngLat([api._lng, api._lat]).setHTML(api._popupHtml).addTo(map);
+      }).setLngLat([api._lng, api._lat]).setHTML(api._popupHtml).addTo(map));
       api._popup = pp;
       if (api._onPopupOpen) {
         try { api._onPopupOpen({ popup: { getElement: () => pp.getElement() } }); }
@@ -635,7 +669,11 @@ function makeMarker(latlng, opts = {}) {
       return api;
     },
     closePopup() {
-      if (api._popup) { api._popup.remove(); api._popup = null; }
+      if (api._popup) {
+        if (activePopup === api._popup) activePopup = null;
+        api._popup.remove();
+        api._popup = null;
+      }
       return api;
     },
     getLatLng() { return { lat: api._lat, lng: api._lng }; },
@@ -647,6 +685,7 @@ function makeMarker(latlng, opts = {}) {
     },
     _attach() { ml.addTo(map); },
     _detach() { ml.remove(); api.closePopup(); },
+    __remove() { api._detach(); },
   };
   return api;
 }
@@ -708,9 +747,10 @@ function makeGeoOverlay(features, layerSpecs, options = {}) {
       return overlay;
     },
     bindTooltip(text) {
-      const popup = new maplibregl.Popup({ closeButton: true, offset: 8 });
+      const popup = registerPopup(new maplibregl.Popup({ closeButton: true, offset: 8 }));
       layerIds.forEach((lid) => {
         map.on('click', lid, (ev) => {
+          activatePopup(popup);
           popup.setLngLat(ev.lngLat).setText(String(text)).addTo(map);
         });
         map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -1114,6 +1154,8 @@ const blurVal         = document.getElementById('blurVal');
 const weightControls  = document.getElementById('weightControls');
 const resultsCard     = document.getElementById('resultsCard');
 const resultsList     = document.getElementById('resultsList');
+const resultsHistoryHint = document.getElementById('resultsHistoryHint');
+const clearResultsBtn = document.getElementById('clearResultsBtn');
 const planTripBtn     = document.getElementById('planTripBtn');
 const tripStatusEl    = document.getElementById('tripStatus');
 const sidebarEl       = document.getElementById('sidebar');
@@ -1553,7 +1595,10 @@ map.on('click', function onMapClick(e) {
     .addTo(map);
 
   bindPopupNavBtn(mapClickMarker, lat, lng, label);
-  mapClickMarker.openPopup();
+  /* Defer so overlay tooltips (e.g. planned-trip areas) open first and are
+   * then replaced by this more informative selection popup - one popup only. */
+  const clickedMarker = mapClickMarker;
+  setTimeout(() => { if (clickedMarker === mapClickMarker) clickedMarker.openPopup(); }, 0);
 });
 
 /* ── Trip planning ───────────────────────────────────────────────── */
@@ -2146,6 +2191,7 @@ blurSlider.addEventListener('input', () => {
 
 /* ── Analyze button ──────────────────────────────────────────────── */
 analyzeBtn.addEventListener('click', runAnalysis);
+if (clearResultsBtn) clearResultsBtn.addEventListener('click', clearResults);
 
 async function runAnalysis() {
   if (analyzing) return;
@@ -2219,7 +2265,7 @@ async function runAnalysis() {
     } else {
       terrainLegendEl.classList.add('hidden');
     }
-    renderResults(quietestPoints);
+    renderResults(quietestPoints, bounds);
 
     const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
       ? ` ${unreachablePoints.length} area(s) greyed out (unreachable).`
@@ -2958,14 +3004,173 @@ function renderHeatmap(heatPoints) {
 }
 
 /* ── Results panel ───────────────────────────────────────────────── */
-function renderResults(points) {
-  /* Remove old markers */
-  quietMarkers.forEach(m => map.removeLayer(m));
+
+/** Sequential id for per-run dashed outlines. */
+let quietHistorySeq = 0;
+/** Dashed outline of the current run (hidden until hover). */
+let currentGenRect = null;
+
+/** Marker opacity per generation: current = 1, older runs get fainter. */
+function generationOpacity(depth) {
+  return depth === 0 ? 1 : (depth === 1 ? 0.55 : 0.32);
+}
+
+/**
+ * Build a hidden, dashed outline for the analysed bounding box of one run.
+ * It is only shown while the pointer hovers one of that run's markers.
+ * @param {{south:number, west:number, north:number, east:number}} b
+ */
+function makeGenerationRect(b) {
+  const srcId = `qgen-${++quietHistorySeq}`;
+  const layId = `${srcId}-line`;
+  let removed = false;
+  const ring = [
+    [b.west, b.south], [b.east, b.south], [b.east, b.north], [b.west, b.north], [b.west, b.south],
+  ];
+
+  whenStyleReady(() => {
+    if (removed || map.getSource(srcId)) return;
+    map.addSource(srcId, {
+      type: 'geojson',
+      data: { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } },
+    });
+    map.addLayer({
+      id: layId,
+      type: 'line',
+      source: srcId,
+      layout: { visibility: 'none' },
+      paint: { 'line-color': '#7dd3fc', 'line-width': 1.5, 'line-dasharray': [3, 3], 'line-opacity': 0.9 },
+    });
+  });
+
+  return {
+    show() {
+      whenStyleReady(() => { if (map.getLayer(layId)) map.setLayoutProperty(layId, 'visibility', 'visible'); });
+    },
+    hide() {
+      try { if (map.getLayer(layId)) map.setLayoutProperty(layId, 'visibility', 'none'); } catch { /* style gone */ }
+    },
+    setOpacity(op) {
+      try { if (map.getLayer(layId)) map.setPaintProperty(layId, 'line-opacity', op); } catch { /* style gone */ }
+    },
+    remove() {
+      removed = true;
+      try { if (map.getLayer(layId)) map.removeLayer(layId); } catch { /* ignore */ }
+      try { if (map.getSource(srcId)) map.removeSource(srcId); } catch { /* ignore */ }
+    },
+  };
+}
+
+/** Apply the faded look (and a tooltip) to markers of one generation. */
+function fadeMarkers(markers, depth) {
+  const op = generationOpacity(depth);
+  markers.forEach((m) => {
+    const el = m._ml && m._ml.getElement ? m._ml.getElement() : null;
+    if (!el) return;
+    el.dataset.baseOpacity = String(op);
+    setMarkerOpacity(m, op);
+    el.title = depth > 0
+      ? `Result of an earlier analysis - hover to see the analysed area it came from`
+      : '';
+  });
+}
+
+/**
+ * MapLibre keeps its own opacity value and re-applies it on every pan/zoom,
+ * so marker opacity must go through Marker#setOpacity() - writing
+ * element.style.opacity directly gets overwritten on the next map update.
+ * @param {object} marker  Leaflet-style marker api from makeMarker()
+ * @param {number} op
+ */
+function setMarkerOpacity(marker, op) {
+  if (marker._ml && typeof marker._ml.setOpacity === 'function') {
+    marker._ml.setOpacity(op);
+    return;
+  }
+  const el = marker._ml && marker._ml.getElement ? marker._ml.getElement() : null;
+  if (el) el.style.opacity = String(op);
+}
+
+/** Show the run's dashed area while one of its markers is hovered. */
+function bindGenerationHover(markers, rect) {
+  if (!rect) return;
+  markers.forEach((m) => {
+    const el = m._ml && m._ml.getElement ? m._ml.getElement() : null;
+    if (!el) return;
+    el.addEventListener('mouseenter', () => {
+      rect.show();
+      const base = parseFloat(el.dataset.baseOpacity || '1');
+      if (base < 1) setMarkerOpacity(m, 1);
+    });
+    el.addEventListener('mouseleave', () => {
+      rect.hide();
+      setMarkerOpacity(m, parseFloat(el.dataset.baseOpacity || '1'));
+    });
+  });
+}
+
+/** Keep at most QUIET_HISTORY_MAX earlier runs on the map. */
+function pruneQuietHistory() {
+  while (quietHistory.length > QUIET_HISTORY_MAX) {
+    const old = quietHistory.pop();
+    old.markers.forEach((m) => map.removeLayer(m));
+    if (old.rect) old.rect.remove();
+  }
+}
+
+function updateHistoryHint() {
+  if (!resultsHistoryHint) return;
+  if (!quietHistory.length) {
+    resultsHistoryHint.classList.add('hidden');
+    resultsHistoryHint.textContent = '';
+    return;
+  }
+  const n = quietHistory.length;
+  resultsHistoryHint.classList.remove('hidden');
+  resultsHistoryHint.textContent =
+    `${n} earlier run${n > 1 ? 's' : ''} shown faded - hover a marker to see the area it came from.`;
+}
+
+/**
+ * Render the top quiet spots and demote the previous run(s) to faded history.
+ * @param {Array<{lat:number,lng:number,noiseScore:number}>} points
+ * @param {L.LatLngBounds} [bounds]  analysed view of this run
+ */
+function renderResults(points, bounds) {
+  /* Demote the current markers to history and fade them one step. */
+  if (quietMarkers.length && lastAnalysisBounds) {
+    const entry = { markers: quietMarkers, rect: makeGenerationRect(lastAnalysisBounds) };
+    quietHistory.unshift(entry);
+    quietMarkers = [];
+    pruneQuietHistory();
+    bindGenerationHover(entry.markers, entry.rect);
+  }
+  quietHistory.forEach((e, i) => {
+    fadeMarkers(e.markers, i + 1);
+    e.rect.setOpacity(generationOpacity(i + 1));
+  });
+
+  if (bounds) {
+    lastAnalysisBounds = {
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    };
+  }
+
   quietMarkers = [];
   resultsList.innerHTML = '';
 
   if (!points.length) {
-    resultsCard.classList.add('hidden');
+    updateHistoryHint();
+    if (!quietHistory.length) {
+      resultsCard.classList.add('hidden');
+      return;
+    }
+    resultsCard.classList.remove('hidden');
+    const empty = document.createElement('li');
+    empty.className = 'result-empty-hint';
+    empty.textContent = 'No quiet spots in this view - earlier results are shown faded on the map.';
+    resultsList.appendChild(empty);
     return;
   }
 
@@ -3024,6 +3229,46 @@ function renderResults(points) {
 
     resultsList.appendChild(li);
   });
+
+  /* Dashed area of the current run, shown on marker hover. */
+  fadeMarkers(quietMarkers, 0);
+  if (currentGenRect) { currentGenRect.remove(); currentGenRect = null; }
+  if (lastAnalysisBounds) {
+    currentGenRect = makeGenerationRect(lastAnalysisBounds);
+    bindGenerationHover(quietMarkers, currentGenRect);
+  }
+
+  updateHistoryHint();
+}
+
+/** Remove every analysis result: heatmap, quiet spots, history, overlays. */
+function clearResults() {
+  if (activePopup) { try { activePopup.remove(); } catch { /* ignore */ } activePopup = null; }
+
+  quietMarkers.forEach((m) => map.removeLayer(m));
+  quietMarkers = [];
+  quietHistory.forEach((e) => {
+    e.markers.forEach((m) => map.removeLayer(m));
+    if (e.rect) e.rect.remove();
+  });
+  quietHistory = [];
+  if (currentGenRect) { currentGenRect.remove(); currentGenRect = null; }
+
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+  if (unreachableOverlay) { map.removeLayer(unreachableOverlay); unreachableOverlay = null; }
+  if (vegetationLayer) { map.removeLayer(vegetationLayer); vegetationLayer = null; }
+  if (terrainLayer) { map.removeLayer(terrainLayer); terrainLayer = null; }
+  tripRects.forEach((r) => map.removeLayer(r));
+  tripRects = [];
+  if (mapClickMarker) { map.removeLayer(mapClickMarker); mapClickMarker = null; }
+
+  lastAnalysisBounds = null;
+  resultsList.innerHTML = '';
+  resultsCard.classList.add('hidden');
+  terrainLegendEl.classList.add('hidden');
+  const statusEl = document.getElementById('status');
+  if (statusEl) statusEl.classList.add('hidden');
+  updateHistoryHint();
 }
 
 /* ── Trip rect rendering ─────────────────────────────────────────── */
