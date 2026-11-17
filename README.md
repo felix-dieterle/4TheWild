@@ -141,6 +141,32 @@ all APKs share the same signing key and can be installed as updates without
 uninstalling first. The `versionCode` is set to the workflow run number so Android
 always sees each new build as a newer version.
 
+## Local deployment (home LAN)
+
+The app and its PHP backend are published on the local XAMPP Apache:
+
+| URL | Content |
+|-----|---------|
+| <http://192.168.178.37/apps/wild/> | front-end |
+| `.../apps/wild/api/trips` | trip-planning API (PHP + MariaDB) |
+
+Scripts (ASCII-only, PowerShell 5.1):
+
+```powershell
+# once: create database "4thewild", user and tables, write config.local.php
+.\scripts\setup-db.ps1
+
+# publish front-end + backend to F:\CascadeProjects\mama-razzi\public\apps\wild
+.\scripts\deploy-local.ps1
+
+# build a signed, update-compatible debug APK (versionCode = 1000 + commit count)
+.\scripts\build-apk.ps1
+```
+
+`config.local.php` (database credentials) lives only in the deploy directory
+and is git-ignored. Debug APKs are signed with `F:\.android\.android\debug.keystore`,
+so they can only be built on this PC - that keeps updates installable.
+
 ## PHP/MySQL backend (apps/wild)
 
 A self-contained PHP backend lives under `apps/wild/` and provides **persistent

@@ -1560,9 +1560,18 @@ map.on('click', function onMapClick(e) {
 
 /**
  * Base URL for the trip-planning backend.
- * Change this to the deployed server URL in production.
+ *
+ * Resolves to the directory the web app is served from (e.g.
+ * http://192.168.178.37/apps/wild), where api.php lives - no configuration
+ * needed. `null` means trip planning is unavailable: inside the Android
+ * WebView the assets are served by WebViewAssetLoader, which has no PHP
+ * backend.
  */
-const TRIP_API_BASE = 'http://localhost:3000';
+const TRIP_API_BASE = (() => {
+  if (location.protocol !== 'http:' && location.protocol !== 'https:') return null;
+  if (location.hostname === 'appassets.androidplatform.net') return null;
+  return new URL('.', location.href).href.replace(/\/$/, '');
+})();
 
 /**
  * Noise penalty added per planned trip that overlaps a grid point.
@@ -1726,6 +1735,11 @@ function setCachedWaterways(bounds, ways) {
  * Failures are surfaced to the user but do not block other functionality.
  */
 async function planTrip() {
+  if (TRIP_API_BASE === null) {
+    showTripStatus('⚠️ Trip planning is available in the web version only.', 'error');
+    return;
+  }
+
   const bounds = map.getBounds();
   const payload = {
     south: bounds.getSouth(),
@@ -1761,6 +1775,8 @@ async function planTrip() {
  * @returns {Promise<Array<{south:number,west:number,north:number,east:number}>>}
  */
 async function fetchPlannedTrips(bounds) {
+  if (TRIP_API_BASE === null) return [];
+
   const params = new URLSearchParams({
     south: bounds.getSouth(),
     west:  bounds.getWest(),

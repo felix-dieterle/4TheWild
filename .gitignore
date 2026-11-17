@@ -1,6 +1,10 @@
 node_modules/
 *.log
+*.log.err
 .DS_Store
+
+# Local backend configuration (database credentials)
+apps/wild/config.local.php
 
 # Android build artifacts
 android/app/build/

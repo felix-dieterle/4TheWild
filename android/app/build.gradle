@@ -3,6 +3,16 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+/* versionCode must increase with every delivered APK. Values below 1000 are
+ * shifted into the 1000+ range so old builds (versionCode 1..n) can always be
+ * upgraded in place. Override with -PversionCode=<n> (CI does this). */
+def resolvedVersionCode = project.findProperty('versionCode') != null
+        ? project.property('versionCode').toString().toInteger()
+        : 1000
+if (resolvedVersionCode < 1000) {
+    resolvedVersionCode += 1000
+}
+
 android {
     namespace 'de.felixdieterle.forwild'
     compileSdk 34
@@ -11,7 +21,7 @@ android {
         applicationId "de.felixdieterle.forwild"
         minSdk 26
         targetSdk 34
-        versionCode 1
+        versionCode resolvedVersionCode
         versionName "1.1.0"
     }
 

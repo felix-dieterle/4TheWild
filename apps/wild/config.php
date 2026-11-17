@@ -13,6 +13,13 @@
  *   DB_PASS      MySQL password     (default: empty)
  *   DB_CHARSET   Connection charset (default: utf8mb4)
  *
+ * Alternatively place a `config.local.php` next to this file (git-ignored) that
+ * returns an array of overrides, e.g.
+ *
+ *   <?php return ['user' => 'wild4', 'pass' => '...', 'name' => '4thewild'];
+ *
+ * Values from config.local.php take precedence over environment variables.
+ *
  * Returns a PDO instance with error mode set to EXCEPTION.
  */
 
@@ -25,12 +32,21 @@ function db_connect(): PDO
         return $pdo;
     }
 
-    $host    = getenv('DB_HOST')    ?: 'localhost';
-    $port    = getenv('DB_PORT')    ?: '3306';
-    $dbname  = getenv('DB_NAME')    ?: '4thewild';
-    $user    = getenv('DB_USER')    ?: 'root';
-    $pass    = getenv('DB_PASS')    ?: '';
-    $charset = getenv('DB_CHARSET') ?: 'utf8mb4';
+    $local = [];
+    $localFile = __DIR__ . '/config.local.php';
+    if (is_file($localFile)) {
+        $loaded = require $localFile;
+        if (is_array($loaded)) {
+            $local = $loaded;
+        }
+    }
+
+    $host    = $local['host']    ?? (getenv('DB_HOST')    ?: 'localhost');
+    $port    = $local['port']    ?? (getenv('DB_PORT')    ?: '3306');
+    $dbname  = $local['name']    ?? (getenv('DB_NAME')    ?: '4thewild');
+    $user    = $local['user']    ?? (getenv('DB_USER')    ?: 'root');
+    $pass    = $local['pass']    ?? (getenv('DB_PASS')    ?: '');
+    $charset = $local['charset'] ?? (getenv('DB_CHARSET') ?: 'utf8mb4');
 
     $dsn = "mysql:host={$host};port={$port};dbname={$dbname};charset={$charset}";
 
