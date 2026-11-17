@@ -51,9 +51,6 @@ const TERRAIN_COLORS = {
   demanding_trail: '#ef4444', /* mountain/alpine hiking */
 };
 
-/** Fill colour (rgba) for the canvas overlay that marks unreachable grid cells. */
-const UNREACHABLE_OVERLAY_COLOR = 'rgba(80, 80, 80, 0.60)';
-
 /* ── Road type noise weights (higher = louder) ──────────────────────
  * These are the BASE weights for each highway type, reflecting typical
  * traffic volume and road importance.  They are multiplied at runtime
@@ -3362,47 +3359,42 @@ function renderUnreachableOverlay(unreachablePoints, bounds) {
   }
   if (!unreachablePoints || !unreachablePoints.length) return;
 
-  const W = 512, H = 512;
-  const canvas = document.createElement('canvas');
-  canvas.width  = W;
-  canvas.height = H;
-  const ctx = canvas.getContext('2d');
-
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
   const lngMax = bounds.getEast();
 
-  /* Cell size in canvas pixels (one extra cell to cover rounding gaps) */
-  const cellW = W / GRID_SIZE + 1;
-  const cellH = H / GRID_SIZE + 1;
+  /* Half a grid cell in degrees - cells touch, so they render as one area. */
+  const halfLat = (latMax - latMin) / GRID_SIZE / 2;
+  const halfLng = (lngMax - lngMin) / GRID_SIZE / 2;
 
-  ctx.fillStyle = UNREACHABLE_OVERLAY_COLOR;
-
-  for (const { lat, lng } of unreachablePoints) {
-    const x = ((lng - lngMin) / (lngMax - lngMin)) * W;
-    const y = ((latMax - lat) / (latMax - latMin)) * H;
-    ctx.fillRect(x - cellW / 2, y - cellH / 2, cellW, cellH);
-  }
-
-  const id = 'unreachable-' + (++__overlaySeq);
-  map.addSource(id, {
-    type: 'canvas',
-    canvas,
-    coordinates: [
-      [lngMin, latMax], [lngMax, latMax],
-      [lngMax, latMin], [lngMin, latMin],
-    ],
-    animate: false,
-  });
-  map.addLayer({ id, type: 'raster', source: id, paint: { 'raster-opacity': 1 } });
-
-  unreachableOverlay = {
-    __remove() {
-      try { if (map.getLayer(id)) nativeRemoveLayer(id); } catch { /* ignore */ }
-      try { if (map.getSource(id)) nativeRemoveSource(id); } catch { /* ignore */ }
+  /* GeoJSON cells instead of a bitmap overlay: MapLibre's canvas source
+   * ignores the alpha channel (renders black) and image sources need the
+   * image API, which is fragile across style reloads. */
+  const features = unreachablePoints.map(({ lat, lng }) => ({
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [lng - halfLng, lat - halfLat],
+        [lng + halfLng, lat - halfLat],
+        [lng + halfLng, lat + halfLat],
+        [lng - halfLng, lat + halfLat],
+        [lng - halfLng, lat - halfLat],
+      ]],
     },
-  };
+  }));
+
+  unreachableOverlay = makeGeoOverlay(features, [{
+    id: 'unreachable',
+    type: 'fill',
+    paint: {
+      'fill-color': '#505050',
+      'fill-opacity': 0.6,
+      'fill-antialias': false,
+    },
+  }]).addTo(map);
 }
 function showStatus(msg, type = 'info') {
   statusEl.textContent = msg;
