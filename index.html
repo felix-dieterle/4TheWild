@@ -200,7 +200,44 @@
     </aside>
 
     <!-- ── Map ──────────────────────────────────────────────────── -->
-    <div id="map"></div>
+    <div id="map">
+      <!-- Prominent shortcut outside the sidebar: jump to the quietest
+           reachable spot inside a time radius and start mini navigation. -->
+      <div id="outingPanel">
+        <div class="op-head">
+          <span class="op-title">&#127807; Get me out of here</span>
+          <button id="outingCollapse" type="button" title="Collapse" aria-label="Collapse">&minus;</button>
+        </div>
+        <div id="outingBody">
+          <p class="op-hint">Quietest reachable spot within&hellip;</p>
+          <div class="op-minutes" role="group" aria-label="Travel time in minutes">
+            <button type="button" class="op-min" data-min="5">5</button>
+            <button type="button" class="op-min" data-min="10">10</button>
+            <button type="button" class="op-min active" data-min="15">15</button>
+            <button type="button" class="op-min" data-min="30">30</button>
+            <button type="button" class="op-min" data-min="60">60</button>
+          </div>
+          <div class="op-mode" id="outingMode">on foot &middot; from map centre</div>
+          <button id="outingGo">&#127807; Find &amp; navigate</button>
+        </div>
+      </div>
+
+      <!-- Mini navigation bar: appears as soon as a route is calculated -->
+      <div id="routeBar" class="hidden" role="status" aria-live="polite">
+        <div class="rb-head">
+          <span class="rb-badge" id="rbBadge">ROUTE READY</span>
+          <span class="rb-dest" id="rbDest"></span>
+        </div>
+        <div class="rb-next hidden" id="rbNext"></div>
+        <div class="rb-stats" id="rbStats"></div>
+        <div class="rb-actions">
+          <button type="button" id="rbFollow" class="rb-btn">&#129517; Follow</button>
+          <button type="button" id="rbSteps" class="rb-btn">&#128203; Steps</button>
+          <button type="button" id="rbEnd" class="rb-btn secondary">&#10005; End</button>
+        </div>
+        <ol id="rbStepList" class="rb-steps hidden"></ol>
+      </div>
+    </div>
   </div>
   <!-- Mobile sidebar overlay -->
   <div id="sidebarOverlay" class="hidden"></div>

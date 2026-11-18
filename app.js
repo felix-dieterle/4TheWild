@@ -28,7 +28,7 @@
  */
 
 /* ── App version & build ─────────────────────────────────────────── */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const APP_BUILD   = 1;
 
 /* ── Vegetation noise-dampening factors (0 = no reduction, 1 = full) */
@@ -720,6 +720,91 @@ function reachRadiiM() {
     (m.speedKmh * 1000 / 60) * reachTimeBudgetMin / REACH_DETOUR_FACTOR);
 }
 
+/** Hard upper bound (km) for an analysis box expanded beyond the view. */
+const MAX_ANALYSIS_SPAN_KM = 60;
+
+/** Bounding box {south, north, west, east} of a circle around `origin`. */
+function circleBoundingBox(origin, radiusM) {
+  const dLat = radiusM / 111320;
+  const cos = Math.cos((origin.lat * Math.PI) / 180) || 1e-6;
+  const dLng = radiusM / (111320 * cos);
+  return {
+    south: origin.lat - dLat,
+    north: origin.lat + dLat,
+    west:  origin.lng - dLng,
+    east:  origin.lng + dLng,
+  };
+}
+
+/** Convert a plain box into a MapLibre LngLatBounds. */
+function boxToBounds(box) {
+  return new maplibregl.LngLatBounds([box.west, box.south], [box.east, box.north]);
+}
+
+/** Longest side of a box in kilometres. */
+function boxSpanKm(box) {
+  const midLat = (box.south + box.north) / 2;
+  const latKm = (box.north - box.south) * 111.32;
+  const lngKm = (box.east - box.west) * 111.32 * Math.cos(midLat * Math.PI / 180);
+  return Math.max(latKm, lngKm);
+}
+
+/**
+ * Area that an analysis has to cover.
+ *
+ * Without a travel-time budget the current view is analysed. With a budget the
+ * full travel-time circle around the origin is analysed, so the viewport is no
+ * longer the limit (previously a radius larger than the view had "no effect").
+ * The view is included when it overlaps/neighbours the circle so the heatmap
+ * still covers what the user is looking at; `originOnly` skips that for the
+ * "Get me out of here" shortcut.
+ *
+ * @param {{originOnly?: boolean}} [opts]
+ * @returns {{bounds: object, box: object|null, expanded: boolean,
+ *            origin: object, radiusM: number, minutes: number}}
+ */
+function getAnalysisPlan(opts = {}) {
+  const view = map.getBounds();
+  const origin = getReachOrigin();
+  const timeActive = reachTimeBudgetMin > 0 && selectedTransportModes.size > 0;
+  const viewBox = {
+    south: view.getSouth(), west: view.getWest(),
+    north: view.getNorth(), east: view.getEast(),
+  };
+
+  if (!timeActive) {
+    return { bounds: view, box: viewBox, expanded: false, origin, radiusM: 0, minutes: 0 };
+  }
+  const radiusM = Math.max(...reachRadiiM());
+  if (!Number.isFinite(radiusM) || radiusM <= 0) {
+    return { bounds: view, box: viewBox, expanded: false, origin, radiusM: 0, minutes: 0 };
+  }
+
+  const circle = circleBoundingBox(origin, radiusM * 1.02);
+  let box = circle;
+  if (!opts.originOnly) {
+    box = {
+      south: Math.min(circle.south, viewBox.south),
+      north: Math.max(circle.north, viewBox.north),
+      west:  Math.min(circle.west,  viewBox.west),
+      east:  Math.max(circle.east,  viewBox.east),
+    };
+    /* A far-away view must not blow up the tile download: fall back to the
+     * radius box itself, which is what the budget is about. */
+    if (boxSpanKm(box) > MAX_ANALYSIS_SPAN_KM) box = circle;
+  }
+
+  const expanded = boxSpanKm(box) > boxSpanKm(viewBox) * 1.03;
+  return {
+    bounds: boxToBounds(box),
+    box,
+    expanded,
+    origin,
+    radiusM,
+    minutes: reachTimeBudgetMin,
+  };
+}
+
 /** Farthest distance (m) from `origin` to a corner of the map view. */
 function maxViewCornerDistanceM(origin, bounds) {
   const b = bounds || map.getBounds();
@@ -735,10 +820,10 @@ function maxViewCornerDistanceM(origin, bounds) {
 }
 
 /**
- * State of the travel-time radius: off | no-mode | active | ineffective.
- * The radius is plain geometry, so it does not depend on the tile zoom level;
- * it is only ineffective when it is larger than the current view (then it
- * cannot grey out anything, and the UI must say so).
+ * State of the travel-time radius: off | no-mode | active.
+ * The radius is plain geometry, so it does not depend on the tile zoom level.
+ * `coversView` tells whether the radius is larger than the visible map - the
+ * analysis then expands beyond the view instead of being limited by it.
  */
 function getTimeFilterState() {
   const modeSpeeds = selectedModeSpeeds();
@@ -747,18 +832,19 @@ function getTimeFilterState() {
   const base = { origin, routeRuleActive, modeSpeeds };
 
   if (!(reachTimeBudgetMin > 0)) {
-    return Object.assign(base, { state: 'off', radiusM: 0, maxCornerM: 0 });
+    return Object.assign(base, { state: 'off', radiusM: 0, maxCornerM: 0, coversView: false });
   }
   if (!modeSpeeds.length) {
-    return Object.assign(base, { state: 'no-mode', radiusM: 0, maxCornerM: 0 });
+    return Object.assign(base, { state: 'no-mode', radiusM: 0, maxCornerM: 0, coversView: false });
   }
 
   const radiusM = Math.max(...reachRadiiM());
   const maxCornerM = maxViewCornerDistanceM(origin);
   return Object.assign(base, {
-    state: radiusM < maxCornerM ? 'active' : 'ineffective',
+    state: 'active',
     radiusM,
     maxCornerM,
+    coversView: radiusM >= maxCornerM,
   });
 }
 
@@ -794,8 +880,7 @@ function updateTimeFilterUI() {
     reachTimeSlider.disabled = selectedTransportModes.size === 0;
   }
   if (labelEl) {
-    labelEl.classList.toggle('is-inactive',
-      selectedTransportModes.size === 0 || st.state === 'ineffective');
+    labelEl.classList.toggle('is-inactive', selectedTransportModes.size === 0);
   }
   if (!stateEl) return;
 
@@ -812,15 +897,14 @@ function updateTimeFilterUI() {
   } else {
     const radius = formatRadiusM(st.radiusM);
     const origin = st.origin.label;
-    if (st.state === 'active') {
-      stateEl.classList.add('active');
+    stateEl.classList.add('active');
+    if (st.coversView) {
+      text = `Time filter active – ${reachTimeBudgetMin} min ≈ ${radius} straight-line radius ` +
+        `${origin}. The radius is larger than this view: Analyze (and Get me out of here) ` +
+        'covers the full radius automatically.';
+    } else {
       text = `Time filter active – ${reachTimeBudgetMin} min ≈ ${radius} straight-line radius ` +
         `${origin}. Everything outside is greyed out.`;
-    } else {
-      stateEl.classList.add('warn');
-      text = `Time filter not effective – the ${formatRadiusM(st.radiusM, 2)} radius ${origin} is larger ` +
-        `than this view (${formatRadiusM(st.maxCornerM, 2)} to the far corner). ` +
-        'Zoom out or reduce the time.';
     }
     if (st.origin.label.indexOf('map centre') !== -1) {
       text += ' The origin is the map centre and follows the map – enable location for a fixed origin.';
@@ -844,15 +928,33 @@ function analysisSignature(info) {
   });
 }
 
+/** Zoom level a fresh analysis would actually run at (expanded boxes are
+ *  loaded by temporarily fitting the map to the analysis box). */
+function plannedAnalysisZoom(plan) {
+  if (!plan || !plan.expanded) return map.getZoom();
+  try {
+    const cam = map.cameraForBounds(plan.bounds);
+    if (cam && Number.isFinite(cam.zoom)) return cam.zoom;
+  } catch { /* fall through */ }
+  return map.getZoom();
+}
+
 /** Signature of what a fresh analysis would use right now. */
 function currentAnalysisSignature() {
-  const b = map.getBounds();
+  /* Use the same (possibly radius-expanded) box that runAnalysis would use so
+   * an expanded analysis does not look "stale" right after it finished. */
+  const plan = getAnalysisPlan();
+  const b = plan.box || {
+    south: map.getBounds().getSouth(), west: map.getBounds().getWest(),
+    north: map.getBounds().getNorth(), east: map.getBounds().getEast(),
+  };
   return analysisSignature({
     modes: [...selectedTransportModes],
     budgetMin: reachTimeBudgetMin > 0 && selectedTransportModes.size ? reachTimeBudgetMin : 0,
-    routeRuleActive: selectedTransportModes.size > 0 && map.getZoom() >= MIN_REACH_ZOOM,
+    routeRuleActive: selectedTransportModes.size > 0 &&
+      plannedAnalysisZoom(plan) >= MIN_REACH_ZOOM,
     originLabel: getReachOrigin().label,
-    bounds: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+    bounds: b,
   });
 }
 
@@ -878,7 +980,7 @@ function updateFilterSummary() {
   }
   if (a.budgetMin > 0) {
     parts.push(`${a.budgetMin} min ≈ ${formatRadiusM(a.radiusM)} straight-line radius ${a.originLabel}` +
-      (a.radiusEffective ? '' : ' (larger than this view – no effect)'));
+      (a.expanded ? ' (analysis covered the full radius, beyond the view)' : ''));
   } else {
     parts.push('time filter off');
   }
@@ -1105,7 +1207,7 @@ function registerPopup(pp) {
 function latLngBounds(points) {
   const b = new maplibregl.LngLatBounds();
   points.forEach(([lat, lng]) => b.extend([lng, lat]));
-  return { __bounds: b };
+  return b;
 }
 
 /**
@@ -1382,6 +1484,7 @@ function placeLocationMarker(lat, lng, accuracy) {
   /* The radius origin just changed from "map centre" to "your location". */
   updateTimeFilterUI();
   updateFilterSummary();
+  updateOutingPanelState();
 }
 
 /**
@@ -1403,6 +1506,8 @@ function startLocationWatch() {
     }
     placeLocationMarker(lat, lng, accuracy);
     updateLocationStatus();
+    /* Mini navigation follows the user and updates the remaining distance. */
+    if (navSession) updateNavProgress(lat, lng);
   }
 
   const geo = NativeGeolocation();
@@ -1786,7 +1891,7 @@ async function geocodeAddress(query) {
  */
 async function fetchRoute(fromLat, fromLon, toLat, toLon, profile) {
   const coords = `${fromLon},${fromLat};${toLon},${toLat}`;
-  const url = `${OSRM_BASE}/route/v1/${profile}/${coords}?overview=full&geometries=geojson`;
+  const url = `${OSRM_BASE}/route/v1/${profile}/${coords}?overview=full&geometries=geojson&steps=true`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Routing request failed (HTTP ${resp.status})`);
   const data = await resp.json();
@@ -1794,10 +1899,34 @@ async function fetchRoute(fromLat, fromLon, toLat, toLon, profile) {
     throw new Error('No route found for the given locations.');
   }
   const route = data.routes[0];
+
+  /* A zero-length route means the router snapped both points onto the same
+   * place (e.g. an area missing from the routing dataset). Do not enter
+   * "arrived" navigation for that. */
+  if (!(route.distance > 0) || !route.geometry || !route.geometry.coordinates ||
+      route.geometry.coordinates.length < 2) {
+    throw new Error('No usable route found for these points.');
+  }
+
+  /* Flatten the turn-by-turn steps of all legs for the mini navigation bar. */
+  const steps = [];
+  (route.legs || []).forEach((leg) => {
+    (leg.steps || []).forEach((st) => {
+      steps.push({
+        distance: st.distance || 0,
+        duration: st.duration || 0,
+        type:     (st.maneuver && st.maneuver.type) || '',
+        modifier: (st.maneuver && st.maneuver.modifier) || '',
+        name:     st.name || '',
+      });
+    });
+  });
+
   return {
     coordinates: route.geometry.coordinates, /* [lon, lat] pairs */
     distance:    route.distance,             /* metres            */
     duration:    route.duration,             /* seconds           */
+    steps,
   };
 }
 
@@ -1830,10 +1959,273 @@ function clearRoute() {
     map.removeLayer(routeLayer);
     routeLayer = null;
   }
+  stopNavSession();
   document.getElementById('navInfo').classList.add('hidden');
   document.getElementById('clearRouteBtn').classList.add('hidden');
   hideNavStatus();
 }
+
+/* ── Mini navigation mode ─────────────────────────────────────────── */
+/* After a route is calculated the app switches to a compact navigation bar
+ * on the map: the route is already active, no second "Navigate" click is
+ * needed. With a GPS fix the bar follows the user and shows the next turn. */
+
+let navSession = null;
+
+/** Arrows for the common OSRM maneuver modifiers. */
+const MANEUVER_ARROWS = {
+  left: '←', right: '→', 'slight left': '↖', 'slight right': '↗',
+  'sharp left': '↰', 'sharp right': '↱', straight: '↑', uturn: '↩',
+};
+
+function stepArrow(step) {
+  if (step.type === 'arrive') return '🏁';
+  if (step.type === 'depart') return '↑';
+  if (step.type === 'roundabout' || step.type === 'rotary') return '↻';
+  if (step.type === 'merge') return '⤵';
+  return MANEUVER_ARROWS[step.modifier] || '↑';
+}
+
+function maneuverText(step) {
+  const road = step.name ? ` onto ${step.name}` : '';
+  const mod = step.modifier ? ` ${step.modifier}` : '';
+  switch (step.type) {
+    case 'depart':
+      return `Head out${step.name ? ` on ${step.name}` : ''}`;
+    case 'arrive':
+      return 'Arrive at your destination';
+    case 'roundabout':
+    case 'rotary':
+      return `Take the roundabout${road}`;
+    case 'merge':
+      return `Merge${mod}${road}`;
+    case 'fork':
+      return `Keep ${step.modifier || 'straight'}${road}`;
+    case 'end of road':
+      return `Turn${mod} at the end of the road${road}`;
+    case '':
+      return `Continue${road}`;
+    default:
+      return `${step.type.charAt(0).toUpperCase()}${step.type.slice(1)}${mod}${road}`;
+  }
+}
+
+/**
+ * Project a coordinate onto the route polyline. Returns the distance travelled
+ * along the route (metres) and the perpendicular distance to it, so GPS jumps
+ * and detours do not fake forward progress.
+ */
+function projectOnPolyline(lat, lng, polyline, cum) {
+  const mPerLat = 111320;
+  const mPerLng = 111320 * Math.cos(lat * Math.PI / 180) || 1;
+  const px = lng * mPerLng;
+  const py = lat * mPerLat;
+  let best = { alongM: 0, distanceM: Infinity };
+  for (let i = 1; i < polyline.length; i++) {
+    const aLat = polyline[i - 1][0], aLng = polyline[i - 1][1];
+    const bLat = polyline[i][0],     bLng = polyline[i][1];
+    const ax = aLng * mPerLng, ay = aLat * mPerLat;
+    const bx = bLng * mPerLng, by = bLat * mPerLat;
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    let t = 0;
+    if (lenSq > 0) t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+    const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    if (d < best.distanceM) {
+      const segLen = Math.sqrt(lenSq) || haversineDistanceM(aLat, aLng, bLat, bLng);
+      best = { alongM: cum[i - 1] + t * segLen, distanceM: d };
+    }
+  }
+  return best;
+}
+
+function nextStepIndex(session) {
+  for (let i = 0; i < session.steps.length; i++) {
+    if (session.stepEnds[i] > session.progressM + 5) return i;
+  }
+  return null;
+}
+
+/** Fill the compact bar with the current state of `navSession`. */
+function renderNavBar() {
+  const bar = document.getElementById('routeBar');
+  if (!bar) return;
+  if (!navSession) {
+    bar.classList.add('hidden');
+    bar.classList.remove('arrived');
+    return;
+  }
+  const s = navSession;
+  const arrived = s.remainingM < 25;
+
+  bar.classList.remove('hidden');
+  bar.classList.toggle('arrived', arrived);
+
+  document.getElementById('rbBadge').textContent =
+    arrived ? 'ARRIVED' : (s.follow ? '🧭 MINI NAV' : 'ROUTE READY');
+  document.getElementById('rbDest').textContent = s.label || 'Destination';
+
+  const nextEl = document.getElementById('rbNext');
+  if (arrived) {
+    nextEl.innerHTML = '<span class="rb-arrow">🏁</span> You have arrived';
+    nextEl.classList.remove('hidden');
+  } else {
+    const idx = nextStepIndex(s);
+    if (idx == null) {
+      nextEl.classList.add('hidden');
+    } else {
+      const step = s.steps[idx];
+      const dist = Math.max(0, s.stepEnds[idx] - s.progressM);
+      nextEl.innerHTML =
+        `<span class="rb-arrow">${stepArrow(step)}</span> ${maneuverText(step)}` +
+        (dist > 15 ? ` <b>in ${formatDistanceM(dist)}</b>` : '');
+      nextEl.classList.remove('hidden');
+    }
+  }
+
+  document.getElementById('rbStats').textContent =
+    `${formatDistance(s.remainingM)} · ${formatDuration(s.remainingS)} remaining` +
+    (s.follow ? '' : ' · tap Follow for live guidance');
+
+  const followBtn = document.getElementById('rbFollow');
+  followBtn.textContent = s.follow ? '⏸ Pause' : '🧭 Follow';
+  followBtn.classList.toggle('active', s.follow);
+}
+
+/** Render the full turn list (toggle with the "Steps" button). */
+function renderStepList() {
+  const list = document.getElementById('rbStepList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!navSession || !navSession.steps.length) {
+    list.classList.add('hidden');
+    return;
+  }
+  navSession.steps.forEach((step) => {
+    const li = document.createElement('li');
+    const arrow = document.createElement('span');
+    arrow.className = 'rs-arrow';
+    arrow.textContent = stepArrow(step);
+    const text = document.createElement('span');
+    text.textContent = maneuverText(step);
+    const dist = document.createElement('span');
+    dist.className = 'rs-dist';
+    dist.textContent = formatDistanceM(step.distance || 0);
+    li.append(arrow, text, dist);
+    list.appendChild(li);
+  });
+}
+
+/**
+ * Enter mini navigation for a freshly calculated route.
+ * @param {{route: object, label: string, destLat: number, destLng: number,
+ *          follow: boolean}} cfg
+ */
+function startNavSession(cfg) {
+  const route = cfg.route;
+  const polyline = route.coordinates.map(([lon, lat]) => [lat, lon]);
+  const cum = [0];
+  for (let i = 1; i < polyline.length; i++) {
+    cum.push(cum[i - 1] + haversineDistanceM(
+      polyline[i - 1][0], polyline[i - 1][1], polyline[i][0], polyline[i][1]));
+  }
+  const stepEnds = [];
+  let acc = 0;
+  (route.steps || []).forEach((step) => { acc += step.distance || 0; stepEnds.push(acc); });
+
+  navSession = {
+    route,
+    label: cfg.label || 'Destination',
+    polyline,
+    cum,
+    totalM: cum[cum.length - 1] || route.distance,
+    steps: route.steps || [],
+    stepEnds,
+    destLat: cfg.destLat,
+    destLng: cfg.destLng,
+    follow: !!cfg.follow,
+    progressM: 0,
+    remainingM: route.distance,
+    remainingS: route.duration,
+  };
+
+  if (locationMarker) {
+    const ll = locationMarker.getLatLng();
+    updateNavProgress(ll.lat, ll.lng, { recenter: false });
+  }
+  renderStepList();
+  renderNavBar();
+
+  if (cfg.follow && locationMarker) {
+    const ll = locationMarker.getLatLng();
+    map.easeTo({ center: [ll.lng, ll.lat], zoom: Math.max(map.getZoom(), 14), duration: 800 });
+  }
+}
+
+/** Recompute remaining distance/time from a new GPS fix. */
+function updateNavProgress(lat, lng, opts = {}) {
+  if (!navSession) return;
+  const s = navSession;
+  const p = projectOnPolyline(lat, lng, s.polyline, s.cum);
+  /* Progress never goes backwards - a noisy fix or a detour must not rewind. */
+  s.progressM = Math.max(s.progressM, Math.min(p.alongM, s.totalM));
+  s.remainingM = Math.max(0, s.totalM - s.progressM);
+  const ratio = s.totalM > 0 ? s.remainingM / s.totalM : 0;
+  s.remainingS = s.route.duration * ratio;
+  renderNavBar();
+  if (s.follow && opts.recenter !== false) {
+    map.easeTo({ center: [lng, lat], duration: 900, zoom: Math.max(map.getZoom(), 14) });
+  }
+}
+
+/** Leave mini navigation mode and hide the route bar. */
+function stopNavSession() {
+  navSession = null;
+  const bar = document.getElementById('routeBar');
+  if (bar) {
+    bar.classList.add('hidden');
+    bar.classList.remove('arrived');
+  }
+  const list = document.getElementById('rbStepList');
+  if (list) list.classList.add('hidden');
+}
+
+/* Route bar controls (created once - the elements exist in index.html). */
+(function wireRouteBar() {
+  const bar = document.getElementById('routeBar');
+  if (!bar) return;
+
+  document.getElementById('rbEnd').addEventListener('click', clearRoute);
+
+  document.getElementById('rbSteps').addEventListener('click', () => {
+    const list = document.getElementById('rbStepList');
+    if (!list) return;
+    if (!list.children.length) renderStepList();
+    list.classList.toggle('hidden');
+  });
+
+  document.getElementById('rbFollow').addEventListener('click', () => {
+    if (!navSession) return;
+    navSession.follow = !navSession.follow;
+    if (navSession.follow) {
+      if (locationMarker) {
+        const ll = locationMarker.getLatLng();
+        map.easeTo({ center: [ll.lng, ll.lat], duration: 700, zoom: Math.max(map.getZoom(), 14) });
+      } else {
+        showNavStatus('📍 Enable location access for live guidance.', 'info');
+      }
+    }
+    renderNavBar();
+  });
+
+  /* Panning the map pauses the automatic camera follow, but keeps the route. */
+  map.on('dragstart', () => {
+    if (navSession && navSession.follow) {
+      navSession.follow = false;
+      renderNavBar();
+    }
+  });
+})();
 
 /**
  * Geocode the destination, calculate the route from the user's current
@@ -1929,7 +2321,17 @@ async function calculateRoute() {
       `⏱ ${formatDuration(route.duration)}`;
     document.getElementById('navInfo').classList.remove('hidden');
     document.getElementById('clearRouteBtn').classList.remove('hidden');
-    hideNavStatus();
+
+    /* No second "Navigate" click: the route is active and mini navigation
+     * starts right away (turn list + live progress when GPS is available). */
+    startNavSession({
+      route,
+      label: dest.displayName,
+      destLat: dest.lat,
+      destLng: dest.lon,
+      follow: !!locationMarker,
+    });
+    showNavStatus('✅ Route active – mini navigation is running on the map.', 'success');
 
   } catch (err) {
     console.warn('Navigation error:', err.message);
@@ -2012,7 +2414,15 @@ async function navigateToCoords(lat, lng, label) {
     document.getElementById('navDuration').textContent = `⏱ ${formatDuration(route.duration)}`;
     document.getElementById('navInfo').classList.remove('hidden');
     document.getElementById('clearRouteBtn').classList.remove('hidden');
-    hideNavStatus();
+
+    startNavSession({
+      route,
+      label,
+      destLat: lat,
+      destLng: lng,
+      follow: !!locationMarker,
+    });
+    showNavStatus('✅ Route active – mini navigation is running on the map.', 'success');
 
   } catch (err) {
     console.warn('Navigation error:', err.message);
@@ -2700,6 +3110,7 @@ function buildTransportUI() {
       lastReachCtx = null;
       updateTimeFilterUI();
       updateFilterSummary();
+      updateOutingPanelState();
     });
 
     const icon = document.createElement('span');
@@ -2743,6 +3154,8 @@ if (reachTimeSlider) {
     lastReachCtx = null;
     updateTimeFilterUI();
     updateFilterSummary();
+    if (reachTimeBudgetMin > 0) outingMinutes = reachTimeBudgetMin;
+    updateOutingPanelState();
   });
 }
 
@@ -2753,15 +3166,104 @@ map.on('moveend', () => {
   moveUiTimer = setTimeout(() => {
     updateTimeFilterUI();
     updateFilterSummary();
+    updateOutingPanelState();
   }, 200);
 });
 
+/* ── "Get me out of here" shortcut ───────────────────────────────────
+ * Lives on the map (outside the sidebar): pick minutes, find the quietest
+ * reachable spot in that radius and start mini navigation immediately. */
+let outingMinutes = 15;
+
+function updateOutingPanelState() {
+  const modeEl = document.getElementById('outingMode');
+  if (modeEl) {
+    const ids = [...selectedTransportModes];
+    const modeText = ids.length ? modesLabelText(ids) : 'walk (default)';
+    modeEl.textContent = `${modeText} · ${getReachOrigin().label}`;
+  }
+  document.querySelectorAll('.op-min').forEach((btn) => {
+    btn.classList.toggle('active', parseInt(btn.dataset.min, 10) === outingMinutes);
+  });
+}
+
+async function getMeOutOfHere() {
+  const goBtn = document.getElementById('outingGo');
+  if (!goBtn || goBtn.disabled || analyzing) return;
+  goBtn.disabled = true;
+  try {
+    /* The time radius needs a speed: default to walking when none is selected. */
+    if (!selectedTransportModes.size) {
+      selectedTransportModes = new Set(['foot']);
+      syncTransportCheckboxes();
+    }
+    if (selectedTransportModes.size === 1) {
+      const profile = TRANSPORT_TO_NAV[[...selectedTransportModes][0]];
+      if (profile) {
+        navMode = profile;
+        syncNavButtons();
+      }
+    }
+
+    reachTimeBudgetMin = outingMinutes;
+    if (reachTimeSlider) reachTimeSlider.value = String(outingMinutes);
+    updateTimeFilterUI();
+    updateFilterSummary();
+    updateOutingPanelState();
+
+    showStatus(`🌿 Searching the quietest reachable spot within ${outingMinutes} min…`, 'info');
+    const res = await runAnalysis({ originOnly: true });
+    if (!res) return;
+
+    const best = res.quietestPoints && res.quietestPoints[0];
+    if (!best) {
+      showStatus('❌ No reachable quiet spot found in that radius. Try more minutes or move the map to a mapped area.', 'error');
+      return;
+    }
+
+    if (!locationMarker) {
+      showStatus(`⚠️ No GPS fix – the radius and the route start ${getReachOrigin().label}.`, 'info');
+    }
+    const label = `Quietest spot (${outingMinutes} min · noise index ${best.noiseScore.toFixed(2)})`;
+    await navigateToCoords(best.lat, best.lng, label);
+    showStatus(`🌿 Quietest spot within ${outingMinutes} min selected – mini navigation active.`, 'success');
+  } finally {
+    goBtn.disabled = false;
+  }
+}
+
+document.getElementById('outingGo')?.addEventListener('click', getMeOutOfHere);
+document.getElementById('outingCollapse')?.addEventListener('click', () => {
+  const panel = document.getElementById('outingPanel');
+  if (!panel) return;
+  const collapsed = panel.classList.toggle('collapsed');
+  const btn = document.getElementById('outingCollapse');
+  if (btn) btn.textContent = collapsed ? '+' : '−';
+});
+document.querySelectorAll('.op-min').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    outingMinutes = parseInt(btn.dataset.min, 10) || 15;
+    updateOutingPanelState();
+  });
+});
+updateOutingPanelState();
+
 /* ── Analyze button ──────────────────────────────────────────────── */
-analyzeBtn.addEventListener('click', runAnalysis);
+analyzeBtn.addEventListener('click', () => { runAnalysis(); });
 if (clearResultsBtn) clearResultsBtn.addEventListener('click', clearResults);
 
-async function runAnalysis() {
-  if (analyzing) return;
+/** Quietest points of the last completed analysis (best first). */
+let lastQuietestPoints = [];
+
+/**
+ * Analyse the map data and render the result.
+ *
+ * @param {{originOnly?: boolean}} [opts]  `originOnly` analyses the travel-time
+ *   circle only instead of also including the current view.
+ * @returns {Promise<{quietestPoints:Array, coarseData:boolean}|null>}
+ */
+async function runAnalysis(opts = {}) {
+  if (analyzing) return null;
   analyzing = true;
   analyzeBtn.disabled = true;
   /* On mobile, close the sidebar so the map is fully visible */
@@ -2772,11 +3274,43 @@ async function runAnalysis() {
   mapLoadingText.textContent = 'Fetching road data…';
   mapLoadingEl.classList.remove('hidden');
 
+  /* Camera to restore after loading tiles outside the current view. */
+  let restoreCamera = null;
+
   try {
-    const bounds = map.getBounds();
+    /* The analysis area is derived from the travel-time radius, not from the
+     * viewport: a 15 min radius stays 15 min even when the map is zoomed in. */
+    const plan = getAnalysisPlan(opts);
+    const bounds = plan.bounds;
     const useVeg      = vegDampeningCb.checked;
     const useTerrain  = showTerrainCb.checked;
     const useRailways = useRailwaysCb.checked;
+
+    if (plan.expanded) {
+      restoreCamera = {
+        center: map.getCenter(),
+        zoom: map.getZoom(),
+        bearing: map.getBearing(),
+        pitch: map.getPitch(),
+      };
+      showStatus(
+        `🗺️ Radius is larger than the view – loading map data for the full ` +
+        `${plan.minutes} min radius (${formatRadiusM(plan.radiusM)})…`,
+        'info',
+      );
+      mapLoadingText.textContent = 'Loading data for the full radius…';
+      /* Temporarily fit the map to the analysis box so MapLibre loads the
+       * vector tiles for all of it. The view is restored below. */
+      try {
+        const cam = map.cameraForBounds(bounds, { padding: 0 });
+        if (cam) map.jumpTo(cam);
+      } catch {
+        map.fitBounds(bounds, { linear: true, duration: 0, padding: 0 });
+      }
+      await sleep(120);
+      await waitForVectorData();
+      await sleep(120);
+    }
 
     /* Determine extra data needed for reachability filtering */
     const needsWaterways = [...selectedTransportModes].some(id => {
@@ -2799,7 +3333,7 @@ async function runAnalysis() {
 
     if (!ways.length) {
       showStatus('?? No roads in the loaded map data for this view. Zoom in a little or pan to a mapped area, then try again.', 'error');
-      return;
+      return null;
     }
 
     const tripNote = plannedTrips.length
@@ -2821,6 +3355,17 @@ async function runAnalysis() {
       ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays,
     );
 
+    /* Record whether the analysis went beyond the visible view. */
+    if (lastAnalysisInfo) lastAnalysisInfo.expanded = !!plan.expanded;
+
+    /* Back to the user's view before drawing - the result stays visible and
+     * the camera does not jump around while the overlays appear. */
+    if (restoreCamera) {
+      map.jumpTo(restoreCamera);
+      restoreCamera = null;
+      await sleep(80);
+    }
+
     /* Vegetation and terrain sit below the heatmap so they never tint it. */
     renderVegetationLayer(useVeg ? vegetation : []);
     renderTerrainLayer(useTerrain ? terrainWays : []);
@@ -2834,8 +3379,12 @@ async function runAnalysis() {
       terrainLegendEl.classList.add('hidden');
     }
     renderResults(quietestPoints, bounds, coarseData);
+    lastQuietestPoints = quietestPoints;
     updateFilterSummary();
 
+    const radiusNote = plan.expanded
+      ? ` Analysis covered the full ${plan.minutes} min radius (${formatRadiusM(plan.radiusM)}).`
+      : '';
     const reachNote = selectedTransportModes.size > 0 && unreachablePoints.length
       ? ` ${unreachablePoints.length} area(s) greyed out (unreachable).`
       : '';
@@ -2847,12 +3396,15 @@ async function runAnalysis() {
       : '';
     showStatus(
       `✅ Done — ${ways.length} roads analysed, grid ${GRID_SIZE}×${GRID_SIZE}.` +
+      radiusNote +
       (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
       (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : '') +
       (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : '') +
       reachNote + zoomNote,
       'success'
     );
+
+    return { quietestPoints, coarseData, expanded: !!plan.expanded };
   } catch (err) {
     console.error(err);
     logError('Analysis', err.message, err.status);
@@ -2861,7 +3413,12 @@ async function runAnalysis() {
     } else {
       showStatus(`? Error: ${err.message}`, 'error');
     }
+    return null;
   } finally {
+    if (restoreCamera) {
+      try { map.jumpTo(restoreCamera); } catch { /* ignore */ }
+      restoreCamera = null;
+    }
     analyzing = false;
     analyzeBtn.disabled = false;
     mapLoadingEl.classList.add('hidden');
@@ -3497,7 +4054,8 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
     routeRuleActive,
     originLabel: reachOrigin.label,
     radiusM,
-    radiusEffective: radiusM > 0 && radiusM < maxViewCornerDistanceM(reachOrigin, bounds),
+    radiusEffective: radiusM > 0,
+    expanded: false,
     bounds: {
       south: bounds.getSouth(), west: bounds.getWest(),
       north: bounds.getNorth(), east: bounds.getEast(),
@@ -3980,6 +4538,7 @@ function clearResults() {
   lastAnalysisBounds = null;
   lastReachCtx = null;
   lastAnalysisInfo = null;
+  lastQuietestPoints = [];
   resultsList.innerHTML = '';
   resultsCard.classList.add('hidden');
   terrainLegendEl.classList.add('hidden');
@@ -4158,8 +4717,8 @@ function renderReachRadius(ctx) {
     geometry: { type: 'Point', coordinates: [ctx.origin.lng, ctx.origin.lat] },
   });
 
-  const effective = getTimeFilterState().state === 'active';
-  const color = effective ? '#f59e0b' : '#9ca3af';
+  const st = getTimeFilterState();
+  const color = '#f59e0b';
 
   reachRadiusOverlay = makeGeoOverlay(features, [{
     id: 'radius-line',
@@ -4180,9 +4739,9 @@ function renderReachRadius(ctx) {
       'circle-stroke-width': 1.5,
     },
   }], {
-    tooltip: effective
-      ? 'Travel-time radius - areas outside are greyed out'
-      : 'Travel-time radius - larger than this view, so it does not limit anything here',
+    tooltip: st.coversView
+      ? 'Travel-time radius - larger than this view; the analysis covers the full radius'
+      : 'Travel-time radius - areas outside are greyed out',
   }).addTo(map);
 }
 
