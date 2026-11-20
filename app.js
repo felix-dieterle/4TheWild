@@ -28,8 +28,8 @@
  */
 
 /* ── App version & build ─────────────────────────────────────────── */
-const APP_VERSION = '1.2.0';
-const APP_BUILD   = 1;
+const APP_VERSION = '1.4.0';
+const APP_BUILD   = 3;
 
 /* ── Vegetation noise-dampening factors (0 = no reduction, 1 = full) */
 const VEGETATION_DAMPENING = {
@@ -44,6 +44,49 @@ const VEGETATION_DAMPENING = {
   orchard:   0.25,
   vineyard:  0.15,
 };
+
+/* ── Built-up / shopping density ─────────────────────────────────────
+ * Road noise alone misses the crowd factor: a shopping street, a mall or a
+ * dense residential quarter is louder than its roads suggest. The vector
+ * tiles carry `landuse` polygons (available from zoom 4) and `poi` points
+ * (from zoom 11), so these are used as an activity proxy. The `building`
+ * layer of the OpenFreeMap planet build is far too sparse for a density
+ * estimate (a few hundred polygons for a whole city), so it is not used.
+ * Penalties are additive to the noise index, in the same units as
+ * TRIP_NOISE_PENALTY (2 ≈ standing 500 m from a small road).            */
+const LANDUSE_NOISE_PENALTY = {
+  retail:       4.5, /* shopping street, mall area   */
+  commercial:   3.0,
+  industrial:   1.4,
+  railway:      0.6,
+  school:       1.2,
+  hospital:     1.2,
+  kindergarten: 0.9,
+  theme_park:   1.5,
+  residential:  0.6,
+  suburb:       0.25,
+};
+
+/** Per-class activity weight of a POI (shops, gastronomy, offices, ...). */
+const POI_NOISE_WEIGHTS = {
+  supermarket: 1.2, grocery: 1.0, mall: 1.6, department_store: 1.6,
+  marketplace: 1.6, convenience: 0.9, shop: 0.9, clothing_store: 0.8,
+  bakery: 0.6, butcher: 0.6, alcohol_shop: 0.6, hairdresser: 0.5,
+  restaurant: 0.8, fast_food: 0.9, cafe: 0.7, bar: 0.9, pub: 0.9,
+  ice_cream: 0.5, beer: 0.6,
+  cinema: 1.4, theatre: 1.1, museum: 0.7, attraction: 0.7,
+  stadium: 1.5, sports_centre: 0.8, water_park: 1.5, swimming_pool: 0.6,
+  office: 0.5, bank: 0.5, post: 0.4, town_hall: 0.5,
+  hotel: 0.5, lodging: 0.5, hostel: 0.5, guest_house: 0.5,
+  bus: 0.3, railway: 0.4, fuel: 0.8, parking: 0.15,
+  place_of_worship: 0.4, library: 0.4, university: 0.9, college: 0.7,
+};
+
+/** Radius (m) in which POIs are summed, and the weight of that sum. */
+const POI_NOISE_RADIUS_M = 250;
+const POI_NOISE_SCALE    = 0.12;
+/** Bucket size (deg) of the POI spatial index (~220 m). */
+const POI_INDEX_CELL_DEG = 0.002;
 
 /* Colours for the terrain accessibility overlay */
 const TERRAIN_COLORS = {
@@ -409,6 +452,10 @@ let roadWeights     = { ...DEFAULT_ROAD_WEIGHTS };
 let railwayWeights  = { ...DEFAULT_RAILWAY_WEIGHTS };
 let heatLayer       = null;
 let quietMarkers    = [];
+/** True while the "Get me out of here" session owns the result layers. */
+let outingModeActive = false;
+/** Origin frozen at the start of an outing session (keeps repeat runs stable). */
+let outingOrigin    = null;
 /** Earlier analysis results, newest first: { markers, rect, depth }. */
 let quietHistory    = [];
 /** How many earlier runs stay visible (faded) on the map. */
@@ -477,8 +524,11 @@ function speedKmhFor(modeId, tags) {
   return speed;
 }
 
-/** Origin for the travel-time budget: current position, else map centre. */
+/** Origin for the travel-time budget: current position, else map centre.
+ *  During an outing session the origin is frozen, so repeated runs search the
+ *  same circle instead of re-centring on wherever the last route left the map. */
 function getReachOrigin() {
+  if (outingOrigin) return outingOrigin;
   if (locationMarker) {
     const ll = locationMarker.getLatLng();
     return { lat: ll.lat, lng: ll.lng, label: 'from your location' };
@@ -750,6 +800,30 @@ function boxSpanKm(box) {
 }
 
 /**
+ * Zoom at which the vector tiles for `bounds` are read.
+ *
+ * Independent of the current camera, so the same origin + radius + mode always
+ * reads the same tile detail. Capped at the source's maximum zoom (14); larger
+ * boxes naturally yield coarser data, which is honest because the tiles really
+ * do not contain more.
+ *
+ * @param {object} bounds  MapLibre LngLatBounds or {south,west,north,east}
+ * @returns {number}
+ */
+function canonicalDataZoom(bounds) {
+  let z = map.getZoom();
+  try {
+    const b = bounds instanceof maplibregl.LngLatBounds
+      ? bounds
+      : new maplibregl.LngLatBounds(
+          [bounds.west, bounds.south], [bounds.east, bounds.north]);
+    const cam = map.cameraForBounds(b, { padding: 0 });
+    if (cam && Number.isFinite(cam.zoom)) z = cam.zoom;
+  } catch { /* keep the current zoom */ }
+  return Math.max(0, Math.min(DATA_MAX_ZOOM, z));
+}
+
+/**
  * Area that an analysis has to cover.
  *
  * Without a travel-time budget the current view is analysed. With a budget the
@@ -928,15 +1002,11 @@ function analysisSignature(info) {
   });
 }
 
-/** Zoom level a fresh analysis would actually run at (expanded boxes are
- *  loaded by temporarily fitting the map to the analysis box). */
+/** Zoom level a fresh analysis would actually run at (the canonical data zoom
+ *  for the analysis box, independent of the current view). */
 function plannedAnalysisZoom(plan) {
-  if (!plan || !plan.expanded) return map.getZoom();
-  try {
-    const cam = map.cameraForBounds(plan.bounds);
-    if (cam && Number.isFinite(cam.zoom)) return cam.zoom;
-  } catch { /* fall through */ }
-  return map.getZoom();
+  if (!plan) return map.getZoom();
+  return canonicalDataZoom(plan.bounds);
 }
 
 /** Signature of what a fresh analysis would use right now. */
@@ -1004,7 +1074,7 @@ let vegetationLayer = null; /* optional vegetation polygon overlay */
 let terrainLayer    = null; /* optional terrain difficulty overlay */
 /* Noise context saved by computeHeatmap() so individual points can be
  * scored on demand (e.g. when the user taps the map).               */
-let lastNoiseCtx   = null;  /* {segments, mPerLat, mPerLng, vegetation, plannedTrips} */
+let lastNoiseCtx   = null;  /* {segments, mPerLat, mPerLng, vegetation, plannedTrips, builtUp} */
 /* Temporary marker placed when the user taps the map */
 let mapClickMarker = null;
 
@@ -1766,6 +1836,7 @@ const sidebarOverlay  = document.getElementById('sidebarOverlay');
 const vegDampeningCb  = document.getElementById('vegDampening');
 const showTerrainCb   = document.getElementById('showTerrain');
 const useRailwaysCb   = document.getElementById('useRailways');
+const useBuiltUpCb    = document.getElementById('useBuiltUp');
 const terrainLegendEl  = document.getElementById('terrainLegend');
 const errorLogCard     = document.getElementById('errorLogCard');
 const errorLogList     = document.getElementById('errorLogList');
@@ -1953,8 +2024,12 @@ function formatDuration(seconds) {
   return `${m} min`;
 }
 
-/** Remove the currently displayed route from the map. */
-function clearRoute() {
+/**
+ * Remove the currently displayed route from the map.
+ * @param {{keepOuting?: boolean}} [opts]  `keepOuting` keeps an active outing
+ *   session (used internally when switching between its spots).
+ */
+function clearRoute(opts = {}) {
   if (routeLayer) {
     map.removeLayer(routeLayer);
     routeLayer = null;
@@ -1963,6 +2038,7 @@ function clearRoute() {
   document.getElementById('navInfo').classList.add('hidden');
   document.getElementById('clearRouteBtn').classList.add('hidden');
   hideNavStatus();
+  if (!opts.keepOuting) resetOutingCandidates();
 }
 
 /* ── Mini navigation mode ─────────────────────────────────────────── */
@@ -1971,6 +2047,11 @@ function clearRoute() {
  * needed. With a GPS fix the bar follows the user and shows the next turn. */
 
 let navSession = null;
+
+/* Quiet spots found by the last "Get me out of here" run (best first).
+ * The user can cycle through them without starting a new analysis. */
+let outingCandidates = [];
+let outingIndex = 0;
 
 /** Arrows for the common OSRM maneuver modifiers. */
 const MANEUVER_ARROWS = {
@@ -2090,6 +2171,16 @@ function renderNavBar() {
   const followBtn = document.getElementById('rbFollow');
   followBtn.textContent = s.follow ? '⏸ Pause' : '🧭 Follow';
   followBtn.classList.toggle('active', s.follow);
+
+  /* Offer the other quiet spots found by the last outing analysis. */
+  const otherBtn = document.getElementById('rbNextSpot');
+  if (otherBtn) {
+    const hasOthers = outingCandidates.length > 1;
+    otherBtn.classList.toggle('hidden', !hasOthers);
+    if (hasOthers) {
+      otherBtn.textContent = `🔀 Spot ${outingIndex + 1}/${outingCandidates.length}`;
+    }
+  }
 }
 
 /** Render the full turn list (toggle with the "Steps" button). */
@@ -2218,6 +2309,8 @@ function stopNavSession() {
     renderNavBar();
   });
 
+  document.getElementById('rbNextSpot')?.addEventListener('click', () => { showNextQuietSpot(); });
+
   /* Panning the map pauses the automatic camera follow, but keeps the route. */
   map.on('dragstart', () => {
     if (navSession && navSession.follow) {
@@ -2238,6 +2331,9 @@ async function calculateRoute() {
     showNavStatus('⚠️ Please enter a destination.', 'error');
     return;
   }
+
+  /* A new geocoded destination is not part of the outing list. */
+  resetOutingCandidates();
 
   const calcBtn = document.getElementById('calcRouteBtn');
   calcBtn.disabled = true;
@@ -2349,8 +2445,11 @@ async function calculateRoute() {
  * @param {number} lat    Destination latitude
  * @param {number} lng    Destination longitude
  * @param {string} label  Human-readable name shown in the destination popup
+ * @param {{keepOuting?: boolean}} [opts]  `keepOuting` keeps the quiet-spot
+ *   candidate list of the last "Get me out of here" run intact.
  */
-async function navigateToCoords(lat, lng, label) {
+async function navigateToCoords(lat, lng, label, opts = {}) {
+  if (!opts.keepOuting) resetOutingCandidates();
   const calcBtn = document.getElementById('calcRouteBtn');
   if (calcBtn) calcBtn.disabled = true;
   showNavStatus('⏳ Calculating route…', 'info');
@@ -2359,20 +2458,16 @@ async function navigateToCoords(lat, lng, label) {
   document.getElementById('navCard')?.scrollIntoView({ behavior: 'smooth' });
 
   try {
-    /* Prefer the live location marker; fall back to map centre */
+    /* Prefer the live location marker; fall back to the (session-frozen)
+     * analysis origin. Using the map centre here would make the second spot
+     * of an outing start at the first destination. */
     let fromLat, fromLon;
-    if (locationMarker) {
-      const ll = locationMarker.getLatLng();
-      fromLat = ll.lat;
-      fromLon = ll.lng;
-    } else {
-      const centre = map.getCenter();
-      fromLat = centre.lat;
-      fromLon = centre.lng;
-    }
+    const origin = getReachOrigin();
+    fromLat = origin.lat;
+    fromLon = origin.lng;
 
     const route = await fetchRoute(fromLat, fromLon, lat, lng, navMode);
-    clearRoute();
+    clearRoute({ keepOuting: !!opts.keepOuting });
     routeLayer = L.layerGroup();
 
     /* Route polyline */
@@ -2573,18 +2668,41 @@ const ROAD_CACHE_PREFIX  = '4w_roads_';
 const ROAD_CACHE_TTL_MS  = 24 * 60 * 60 * 1000;
 
 /**
- * Build a deterministic localStorage key for the given map bounds.
- * Coordinates are rounded to 4 decimal places (~11 m) so that
- * re-analysing the identical view always produces a cache hit.
+ * Zoom level whose tile detail the current fetch reads. The vector source
+ * carries its finest data at zoom 14 and is over-zoomed above that.
+ */
+const DATA_MAX_ZOOM = 14;
+
+/** Zoom bucket that a cache entry belongs to (tile detail differs per zoom). */
+function dataZoomBucket() {
+  return String(Math.max(0, Math.min(DATA_MAX_ZOOM, Math.round(map.getZoom()))));
+}
+
+/**
+ * Build a deterministic localStorage key for the given map bounds and the
+ * current data zoom. Coordinates are rounded to 4 decimal places (~11 m) so
+ * that re-analysing the identical view always produces a cache hit; the zoom
+ * is part of the key because coarse tiles must never be reused for a detailed
+ * analysis (that produced different quiet spots depending on run order).
+ * @param {string} prefix
  * @param {L.LatLngBounds} bounds
  * @returns {string}
  */
-function roadCacheKey(bounds) {
+function boundsCacheKey(prefix, bounds) {
   const s = bounds.getSouth().toFixed(4);
   const w = bounds.getWest().toFixed(4);
   const n = bounds.getNorth().toFixed(4);
   const e = bounds.getEast().toFixed(4);
-  return `${ROAD_CACHE_PREFIX}${s},${w},${n},${e}`;
+  return `${prefix}${s},${w},${n},${e}|z${dataZoomBucket()}`;
+}
+
+/**
+ * Build a deterministic localStorage key for the given map bounds.
+ * @param {L.LatLngBounds} bounds
+ * @returns {string}
+ */
+function roadCacheKey(bounds) {
+  return boundsCacheKey(ROAD_CACHE_PREFIX, bounds);
 }
 
 /**
@@ -2629,9 +2747,7 @@ function setCachedRoads(bounds, ways) {
 const VEG_CACHE_PREFIX = '4w_veg_';
 
 function vegCacheKey(bounds) {
-  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
-  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
-  return `${VEG_CACHE_PREFIX}${s},${w},${n},${e}`;
+  return boundsCacheKey(VEG_CACHE_PREFIX, bounds);
 }
 function getCachedVegetation(bounds) {
   try {
@@ -2651,9 +2767,7 @@ function setCachedVegetation(bounds, polys) {
 const TERRAIN_CACHE_PREFIX = '4w_terrain_';
 
 function terrainCacheKey(bounds) {
-  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
-  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
-  return `${TERRAIN_CACHE_PREFIX}${s},${w},${n},${e}`;
+  return boundsCacheKey(TERRAIN_CACHE_PREFIX, bounds);
 }
 function getCachedTerrain(bounds) {
   try {
@@ -2673,9 +2787,7 @@ function setCachedTerrain(bounds, ways) {
 const RAILWAY_CACHE_PREFIX = '4w_railway_';
 
 function railwayCacheKey(bounds) {
-  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
-  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
-  return `${RAILWAY_CACHE_PREFIX}${s},${w},${n},${e}`;
+  return boundsCacheKey(RAILWAY_CACHE_PREFIX, bounds);
 }
 function getCachedRailways(bounds) {
   try {
@@ -2695,9 +2807,7 @@ function setCachedRailways(bounds, ways) {
 const WATERWAY_CACHE_PREFIX = '4w_waterway_';
 
 function waterwayCacheKey(bounds) {
-  const s = bounds.getSouth().toFixed(4), w = bounds.getWest().toFixed(4);
-  const n = bounds.getNorth().toFixed(4), e = bounds.getEast().toFixed(4);
-  return `${WATERWAY_CACHE_PREFIX}${s},${w},${n},${e}`;
+  return boundsCacheKey(WATERWAY_CACHE_PREFIX, bounds);
 }
 function getCachedWaterways(bounds) {
   try {
@@ -2926,6 +3036,9 @@ function applyProfile(profile) {
   if (typeof profile.useRailways === 'boolean') {
     useRailwaysCb.checked = profile.useRailways;
   }
+  if (typeof profile.useBuiltUp === 'boolean' && useBuiltUpCb) {
+    useBuiltUpCb.checked = profile.useBuiltUp;
+  }
 }
 
 /**
@@ -2937,6 +3050,7 @@ function snapshotCurrentProfile() {
     roadGroups:    roadSliderElements.map(e => parseFloat(e.slider.value)),
     railwayGroups: railwaySliderElements.map(e => parseFloat(e.slider.value)),
     useRailways:   useRailwaysCb.checked,
+    useBuiltUp:    useBuiltUpCb ? useBuiltUpCb.checked : true,
   };
 }
 
@@ -3211,25 +3325,84 @@ async function getMeOutOfHere() {
     updateFilterSummary();
     updateOutingPanelState();
 
+    /* Start (or continue) an outing session. The origin is frozen for the
+     * whole session: after the first route the map centre sits at the
+     * destination, and re-centring the search there made every repeat run
+     * return different spots. */
+    if (!outingModeActive) outingOrigin = getReachOrigin();
+    outingModeActive = true;
+
     showStatus(`🌿 Searching the quietest reachable spot within ${outingMinutes} min…`, 'info');
     const res = await runAnalysis({ originOnly: true });
     if (!res) return;
 
-    const best = res.quietestPoints && res.quietestPoints[0];
-    if (!best) {
+    const points = res.quietestPoints || [];
+    if (!points.length) {
       showStatus('❌ No reachable quiet spot found in that radius. Try more minutes or move the map to a mapped area.', 'error');
       return;
     }
 
+    /* Keep the best five spots so the user can switch between them. */
+    outingCandidates = points.slice(0, 5);
+    outingIndex = 0;
+
     if (!locationMarker) {
       showStatus(`⚠️ No GPS fix – the radius and the route start ${getReachOrigin().label}.`, 'info');
     }
-    const label = `Quietest spot (${outingMinutes} min · noise index ${best.noiseScore.toFixed(2)})`;
-    await navigateToCoords(best.lat, best.lng, label);
+    await navigateToOutingCandidate(0);
     showStatus(`🌿 Quietest spot within ${outingMinutes} min selected – mini navigation active.`, 'success');
   } finally {
     goBtn.disabled = false;
   }
+}
+
+/**
+ * Label for one quiet spot of the current outing run.
+ * @param {object} p
+ * @param {number} idx
+ */
+function outingSpotLabel(p, idx) {
+  const score = Number.isFinite(p.noiseScore) ? p.noiseScore.toFixed(2) : '?';
+  return `Quiet spot #${idx + 1} (${outingMinutes} min · noise index ${score})`;
+}
+
+/**
+ * Route to candidate `idx` of the current outing list.
+ * @param {number} idx
+ */
+async function navigateToOutingCandidate(idx) {
+  const p = outingCandidates[idx];
+  if (!p) return;
+  outingIndex = idx;
+  /* This mode shows exactly one spot at a time: drop the previous markers so
+   * every "Navigate" / "Other spot" leaves only the new route on the map. */
+  clearQuietSpots();
+  await navigateToCoords(p.lat, p.lng, outingSpotLabel(p, idx), { keepOuting: true });
+  renderNavBar();
+}
+
+/** Route to the next quiet spot of the last outing run (wraps around). */
+async function showNextQuietSpot() {
+  if (outingCandidates.length < 2) return;
+  const next = (outingIndex + 1) % outingCandidates.length;
+  const btn = document.getElementById('rbNextSpot');
+  if (btn) btn.disabled = true;
+  try {
+    await navigateToOutingCandidate(next);
+    showStatus(`🌿 Switched to quiet spot #${next + 1} of ${outingCandidates.length}.`, 'success');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/** Hide the route bar and forget the quiet-spot candidates. */
+function resetOutingCandidates() {
+  outingCandidates = [];
+  outingIndex = 0;
+  outingModeActive = false;
+  outingOrigin = null;
+  const btn = document.getElementById('rbNextSpot');
+  if (btn) btn.classList.add('hidden');
 }
 
 document.getElementById('outingGo')?.addEventListener('click', getMeOutOfHere);
@@ -3285,8 +3458,25 @@ async function runAnalysis(opts = {}) {
     const useVeg      = vegDampeningCb.checked;
     const useTerrain  = showTerrainCb.checked;
     const useRailways = useRailwaysCb.checked;
+    const useBuiltUp  = useBuiltUpCb ? useBuiltUpCb.checked : true;
 
-    if (plan.expanded) {
+    /* ── One canonical data zoom per analysis box ────────────────────── *
+     * querySourceFeatures() only returns the tiles currently loaded, and    *
+     * their detail depends on the map zoom (low zoom = only major roads).  *
+     * Reading the same box at a different zoom therefore produced a        *
+     * different "quietest spot". So the box is always loaded at the zoom   *
+     * the source can actually deliver (max 14), whatever the user views.   */
+    const dataZoom = canonicalDataZoom(bounds);
+    const view = map.getBounds();
+    const box = plan.box || {
+      south: view.getSouth(), west: view.getWest(),
+      north: view.getNorth(), east: view.getEast(),
+    };
+    const boxInsideView = box.south >= view.getSouth() && box.north <= view.getNorth() &&
+                          box.west >= view.getWest() && box.east <= view.getEast();
+    const needsDataView = !boxInsideView || Math.abs(map.getZoom() - dataZoom) > 0.6;
+
+    if (needsDataView) {
       restoreCamera = {
         center: map.getCenter(),
         zoom: map.getZoom(),
@@ -3294,13 +3484,17 @@ async function runAnalysis(opts = {}) {
         pitch: map.getPitch(),
       };
       showStatus(
-        `🗺️ Radius is larger than the view – loading map data for the full ` +
-        `${plan.minutes} min radius (${formatRadiusM(plan.radiusM)})…`,
+        plan.expanded
+          ? `🗺️ Radius is larger than the view – loading map data for the full ` +
+            `${plan.minutes} min radius (${formatRadiusM(plan.radiusM)})…`
+          : `🗺️ Loading map data for the analysis area at zoom ${dataZoom.toFixed(1)}…`,
         'info',
       );
-      mapLoadingText.textContent = 'Loading data for the full radius…';
+      mapLoadingText.textContent = plan.expanded
+        ? 'Loading data for the full radius…'
+        : 'Loading map data for the analysis area…';
       /* Temporarily fit the map to the analysis box so MapLibre loads the
-       * vector tiles for all of it. The view is restored below. */
+       * vector tiles for all of it at one zoom. The view is restored below. */
       try {
         const cam = map.cameraForBounds(bounds, { padding: 0 });
         if (cam) map.jumpTo(cam);
@@ -3322,14 +3516,17 @@ async function runAnalysis(opts = {}) {
       return m?.includeTerrainPaths;
     });
 
-    const [ways, plannedTrips, vegetation, terrainWays, railwayWays, waterwayWays] = await Promise.all([
+    const [ways, plannedTrips, vegetation, terrainWays, railwayWays, waterwayWays, landuse, pois] = await Promise.all([
       fetchRoads(bounds),
       fetchPlannedTrips(bounds),
       useVeg                              ? fetchVegetation(bounds) : Promise.resolve([]),
       (useTerrain || needsTerrainForReach)? fetchTerrain(bounds)    : Promise.resolve([]),
       useRailways                         ? fetchRailways(bounds)   : Promise.resolve([]),
       needsWaterways                      ? fetchWaterways(bounds)  : Promise.resolve([]),
+      useBuiltUp                          ? fetchLanduse(bounds)    : Promise.resolve([]),
+      useBuiltUp                          ? fetchPois(bounds)       : Promise.resolve([]),
     ]);
+    const builtUp = useBuiltUp ? buildBuiltUpContext(landuse, pois) : null;
 
     if (!ways.length) {
       showStatus('?? No roads in the loaded map data for this view. Zoom in a little or pan to a mapped area, then try again.', 'error');
@@ -3345,14 +3542,17 @@ async function runAnalysis(opts = {}) {
     const railwayNote = (useRailways && railwayWays.length)
       ? `, ${railwayWays.length} railway way(s) included`
       : '';
-    showStatus(`🧮 Calculating noise scores for ${ways.length} roads${railwayNote}…${tripNote}${vegNote}`, 'info');
+    const builtUpNote = (useBuiltUp && builtUp)
+      ? `, ${landuse.length} land-use area(s) and ${builtUp.poiCount} POI(s) as crowd proxy`
+      : '';
+    showStatus(`🧮 Calculating noise scores for ${ways.length} roads${railwayNote}${builtUpNote}…${tripNote}${vegNote}`, 'info');
     mapLoadingText.textContent = 'Calculating noise scores…';
 
     /* Yield to the browser before heavy computation */
     await sleep(30);
 
     const { heatPoints, quietestPoints, unreachablePoints, coarseData } = computeHeatmap(
-      ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays,
+      ways, bounds, plannedTrips, vegetation, railwayWays, waterwayWays, terrainWays, builtUp,
     );
 
     /* Record whether the analysis went beyond the visible view. */
@@ -3400,6 +3600,7 @@ async function runAnalysis(opts = {}) {
       (plannedTrips.length ? ` ${plannedTrips.length} planned trip(s) factored in.` : '') +
       (useVeg && vegetation.length ? ` Vegetation dampening applied (${vegetation.length} areas).` : '') +
       (useRailways && railwayWays.length ? ` ${railwayWays.length} railway way(s) included.` : '') +
+      (useBuiltUp && builtUp ? ` Built-up/POI density applied (${builtUp.poiCount} POIs).` : '') +
       reachNote + zoomNote,
       'success'
     );
@@ -3504,6 +3705,24 @@ function queryPolygonFeatures(sourceLayer) {
 
 function coordsToGeometry(coords) {
   return coords.map(([lon, lat]) => ({ lat, lon }));
+}
+
+/** Collect point features from a vector source layer. */
+function queryPointFeatures(sourceLayer) {
+  const raw = map.querySourceFeatures(VECTOR_SOURCE_ID, { sourceLayer });
+  const seen = new Set();
+  const out = [];
+  for (const f of raw) {
+    const g = f.geometry;
+    if (!g || g.type !== 'Point') continue;
+    const props = f.properties || {};
+    const [lng, lat] = g.coordinates;
+    const key = `${props.class || ''}|${lat.toFixed(5)}|${lng.toFixed(5)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ props, lat, lng });
+  }
+  return out;
 }
 
 /** Map OpenMapTiles road classes onto OSM highway tags. */
@@ -3667,6 +3886,136 @@ async function fetchWaterways(bounds) {
   }
   setCachedWaterways(bounds, ways);
   return ways;
+}
+
+/**
+ * Build the reachability/activity context used by the noise score.
+ * @param {Array} landuse  polygons with class/minLat/maxLat/minLon/maxLon/geometry
+ * @param {Array} pois     points with class/lat/lng
+ * @returns {{landuse:Array, poiIndex:object, poiCount:number}|null}
+ */
+function buildBuiltUpContext(landuse, pois) {
+  const usable = (pois || []).filter((p) => POI_NOISE_WEIGHTS[p.class] > 0);
+  if (!landuse.length && !usable.length) return null;
+  return { landuse, poiIndex: buildSpatialIndex(usable, POI_INDEX_CELL_DEG), poiCount: usable.length };
+}
+
+/** Uniform lat/lng bucket index for fast radius queries. */
+function buildSpatialIndex(items, cellDeg) {
+  const buckets = new Map();
+  for (const it of items) {
+    const k = `${Math.floor(it.lat / cellDeg)}:${Math.floor(it.lng / cellDeg)}`;
+    let arr = buckets.get(k);
+    if (!arr) { arr = []; buckets.set(k, arr); }
+    arr.push(it);
+  }
+  return { cellDeg, buckets };
+}
+
+/** Items of the index within `radiusM` of (lat,lng). */
+function nearbyItems(index, lat, lng, radiusM) {
+  if (!index) return [];
+  const dLat = radiusM / 111320;
+  const cos = Math.cos((lat * Math.PI) / 180) || 1e-6;
+  const dLng = radiusM / (111320 * cos);
+  const c = index.cellDeg;
+  const i0 = Math.floor((lat - dLat) / c), i1 = Math.floor((lat + dLat) / c);
+  const j0 = Math.floor((lng - dLng) / c), j1 = Math.floor((lng + dLng) / c);
+  const out = [];
+  for (let i = i0; i <= i1; i++) {
+    for (let j = j0; j <= j1; j++) {
+      const arr = index.buckets.get(`${i}:${j}`);
+      if (!arr) continue;
+      for (const it of arr) {
+        const d = haversineDistanceM(lat, lng, it.lat, it.lng);
+        if (d <= radiusM) out.push({ item: it, dist: d });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Activity penalty for living/shopping density at a point.
+ *
+ * This is what road distance alone cannot see: a residential quarter, a
+ * shopping street or a mall is crowded even if no big road is close. Land-use
+ * polygons give the area character (retail/commercial/residential), POI
+ * density gives the number of shops, restaurants and offices nearby.
+ *
+ * @returns {number} additive penalty in noise-index units
+ */
+function builtUpPenaltyAt(lat, lng, builtUp) {
+  if (!builtUp) return 0;
+  let penalty = 0;
+
+  /* Max (not sum) of overlapping land-use classes, so residential+suburb does
+     not stack into something louder than a shopping street. */
+  let luPenalty = 0;
+  for (const lu of builtUp.landuse) {
+    if (lat < lu.minLat || lat > lu.maxLat || lng < lu.minLon || lng > lu.maxLon) continue;
+    const p = LANDUSE_NOISE_PENALTY[lu.class] || 0;
+    if (p <= luPenalty) continue;
+    if (pointInPolygon(lat, lng, lu.geometry)) luPenalty = p;
+  }
+  penalty += luPenalty;
+
+  /* Weighted POI sum, linearly fading to zero at the radius. */
+  let poiSum = 0;
+  for (const { item, dist } of nearbyItems(builtUp.poiIndex, lat, lng, POI_NOISE_RADIUS_M)) {
+    poiSum += (POI_NOISE_WEIGHTS[item.class] || 0) * (1 - dist / POI_NOISE_RADIUS_M);
+  }
+  penalty += poiSum * POI_NOISE_SCALE;
+
+  return penalty;
+}
+
+/**
+ * Capitalised land-use polygons (retail/commercial/residential/...) for the
+ * given bounds. Not cached: the payload is small and the tile data is already
+ * in memory.
+ * @param {L.LatLngBounds} bounds
+ */
+async function fetchLanduse(bounds) {
+  await waitForVectorData();
+  const out = [];
+  const seen = new Set();
+  for (const { props, ring } of queryPolygonFeatures('landuse')) {
+    const cls = props.class || '';
+    if (!LANDUSE_NOISE_PENALTY[cls]) continue;
+    const anchor = `${cls}|${ring[0].join(',')}`;
+    if (seen.has(anchor)) continue;
+    seen.add(anchor);
+    const geometry = coordsToGeometry(ring);
+    out.push({
+      class: cls,
+      geometry,
+      minLat: Math.min(...geometry.map((p) => p.lat)),
+      maxLat: Math.max(...geometry.map((p) => p.lat)),
+      minLon: Math.min(...geometry.map((p) => p.lon)),
+      maxLon: Math.max(...geometry.map((p) => p.lon)),
+    });
+  }
+  return out;
+}
+
+/**
+ * Activity POIs (shops, gastronomy, offices, ...) for the given bounds.
+ * @param {L.LatLngBounds} bounds
+ */
+async function fetchPois(bounds) {
+  await waitForVectorData();
+  const out = [];
+  const seen = new Set();
+  for (const { props, lat, lng } of queryPointFeatures('poi')) {
+    const cls = props.class || '';
+    if (!POI_NOISE_WEIGHTS[cls]) continue;
+    const key = `${cls}|${lat.toFixed(5)}|${lng.toFixed(5)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ class: cls, lat, lng });
+  }
+  return out;
 }
 
 const GRID_SIZE = 50; /* points per axis - 50x50 = 2 500 sample points */
@@ -3834,9 +4183,10 @@ function dynamicRailwayNoiseFactor(railway, tags) {
  * @param {Array<{south:number,north:number,west:number,east:number}>} plannedTrips
  * @param {number} mPerLat
  * @param {number} mPerLng
+ * @param {object|null} [builtUp]  land-use + POI density context
  * @returns {{noiseScore:number, sourceM:number}} sourceM is Infinity when no segment exists
  */
-function scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng) {
+function scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng, builtUp = null) {
   const px = lng * mPerLng;
   const py = lat * mPerLat;
   let noiseScore = 0;
@@ -3875,10 +4225,13 @@ function scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPe
   }
   noiseScore += tripCount * TRIP_NOISE_PENALTY;
 
+  /* Crowd/built-up penalty: land-use character + nearby POI density. */
+  noiseScore += builtUpPenaltyAt(lat, lng, builtUp);
+
   return { noiseScore, sourceM };
 }
 
-function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = [], waterwayWays = [], reachTerrainWays = []) {
+function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railways = [], waterwayWays = [], reachTerrainWays = [], builtUp = null) {
   const latMin = bounds.getSouth();
   const latMax = bounds.getNorth();
   const lngMin = bounds.getWest();
@@ -3939,7 +4292,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
   }
 
   /* Save context so computeNoiseAtPoint() can score arbitrary clicks */
-  lastNoiseCtx = { segments, mPerLat, mPerLng, vegetation, plannedTrips };
+  lastNoiseCtx = { segments, mPerLat, mPerLng, vegetation, plannedTrips, builtUp };
 
   if (!segments.length) {
     return { heatPoints: [], quietestPoints: [], unreachablePoints: [] };
@@ -4082,7 +4435,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
       }
 
       const { noiseScore, sourceM } = scoreNoiseAt(
-        lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng,
+        lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng, builtUp,
       );
       if (noiseScore > maxNoise) maxNoise = noiseScore;
       gridScores.push({ lat, lng, noiseScore, sourceM });
@@ -4110,7 +4463,7 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
           if (lat < latMin || lat > latMax || lng < lngMin || lng > lngMax) continue;
           if (filterByReachability && !reachContextAllows(reachCtx, lat, lng)) continue;
           const { noiseScore, sourceM } = scoreNoiseAt(
-            lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng,
+            lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng, builtUp,
           );
           refined.push({ lat, lng, noiseScore, sourceM });
         }
@@ -4152,9 +4505,9 @@ function computeHeatmap(ways, bounds, plannedTrips = [], vegetation = [], railwa
  */
 function computeNoiseAtPoint(lat, lng) {
   if (!lastNoiseCtx) return null;
-  const { segments, mPerLat, mPerLng, vegetation, plannedTrips } = lastNoiseCtx;
+  const { segments, mPerLat, mPerLng, vegetation, plannedTrips, builtUp } = lastNoiseCtx;
   if (!segments.length) return 0;
-  return scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng).noiseScore;
+  return scoreNoiseAt(lat, lng, segments, vegetation, plannedTrips, mPerLat, mPerLng, builtUp).noiseScore;
 }
 
 /**
@@ -4380,14 +4733,34 @@ function updateHistoryHint() {
 }
 
 /**
+ * Remove the quiet-spot markers (current run and faded history) without
+ * touching the heatmap or the other overlays.
+ */
+function clearQuietSpots() {
+  quietMarkers.forEach((m) => map.removeLayer(m));
+  quietMarkers = [];
+  quietHistory.forEach((e) => {
+    e.markers.forEach((m) => map.removeLayer(m));
+    if (e.rect) e.rect.remove();
+  });
+  quietHistory = [];
+  if (currentGenRect) { currentGenRect.remove(); currentGenRect = null; }
+  updateHistoryHint();
+}
+
+/**
  * Render the top quiet spots and demote the previous run(s) to faded history.
+ * In outing mode the previous run is removed instead (one spot at a time).
  * @param {Array<{lat:number,lng:number,noiseScore:number,sourceM:number}>} points
  * @param {L.LatLngBounds} [bounds]  analysed view of this run
  * @param {boolean} [coarseData]     true when only major roads were available
  */
 function renderResults(points, bounds, coarseData = false) {
-  /* Demote the current markers to history and fade them one step. */
-  if (quietMarkers.length && lastAnalysisBounds) {
+  if (outingModeActive) {
+    /* Exclusive view: a new outing run replaces the old spots entirely. */
+    clearQuietSpots();
+  } else if (quietMarkers.length && lastAnalysisBounds) {
+    /* Demote the current markers to history and fade them one step. */
     const entry = { markers: quietMarkers, rect: makeGenerationRect(lastAnalysisBounds) };
     quietHistory.unshift(entry);
     quietMarkers = [];
@@ -4539,6 +4912,8 @@ function clearResults() {
   lastReachCtx = null;
   lastAnalysisInfo = null;
   lastQuietestPoints = [];
+  outingModeActive = false;
+  outingOrigin = null;
   resultsList.innerHTML = '';
   resultsCard.classList.add('hidden');
   terrainLegendEl.classList.add('hidden');
@@ -4819,6 +5194,125 @@ if (errorLogClearBtn) {
     renderErrorLog();
   });
 }
+
+/* ── Start screen: two ways into the app ───────────────────────────
+ * On launch the user only chooses between "Get me out of here" (pick a
+ * time + travel mode, then navigate straight to the quietest reachable
+ * spot) and the normal full app. */
+const START_MODE_TO_TRANSPORT = { foot: 'foot', cycling: 'bike', driving: 'car' };
+let startMinutes = 15;
+let startProfile = 'foot';
+
+function openStartScreen() {
+  const el = document.getElementById('startScreen');
+  if (!el) return;
+  el.classList.remove('hidden');
+  document.getElementById('startChoices')?.classList.remove('hidden');
+  document.getElementById('startOutingConfig')?.classList.add('hidden');
+  syncStartScreenUI();
+}
+
+function closeStartScreen() {
+  document.getElementById('startScreen')?.classList.add('hidden');
+}
+
+/** Reflect the current time/mode choice in the start screen controls. */
+function syncStartScreenUI() {
+  document.querySelectorAll('.ss-min').forEach((btn) => {
+    btn.classList.toggle('active', parseInt(btn.dataset.min, 10) === startMinutes);
+  });
+  const custom = document.getElementById('startCustomMin');
+  if (custom && custom.value && parseInt(custom.value, 10) !== startMinutes) {
+    custom.value = '';
+  }
+  document.querySelectorAll('.ss-mode').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.profile === startProfile);
+  });
+}
+
+/** Clamp a minute value to a sensible range. */
+function clampStartMinutes(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 15;
+  return Math.max(1, Math.min(240, n));
+}
+
+document.getElementById('startOutingBtn')?.addEventListener('click', () => {
+  document.getElementById('startChoices')?.classList.add('hidden');
+  document.getElementById('startOutingConfig')?.classList.remove('hidden');
+});
+
+document.getElementById('startNormalBtn')?.addEventListener('click', closeStartScreen);
+
+document.getElementById('startOutingBack')?.addEventListener('click', () => {
+  document.getElementById('startOutingConfig')?.classList.add('hidden');
+  document.getElementById('startChoices')?.classList.remove('hidden');
+});
+
+document.querySelectorAll('.ss-min').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    startMinutes = clampStartMinutes(btn.dataset.min);
+    const custom = document.getElementById('startCustomMin');
+    if (custom) custom.value = '';
+    syncStartScreenUI();
+  });
+});
+
+document.getElementById('startCustomMin')?.addEventListener('input', (e) => {
+  const raw = e.target.value.trim();
+  if (!raw) return;
+  startMinutes = clampStartMinutes(raw);
+  syncStartScreenUI();
+});
+
+document.querySelectorAll('.ss-mode').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    startProfile = btn.dataset.profile || 'foot';
+    syncStartScreenUI();
+  });
+});
+
+/** Apply the start-screen choices and navigate to the best quiet spot. */
+async function startOutingFromStartScreen() {
+  const goBtn = document.getElementById('startOutingGo');
+  if (goBtn) goBtn.disabled = true;
+
+  outingMinutes = startMinutes;
+  const transport = START_MODE_TO_TRANSPORT[startProfile] || 'foot';
+  selectedTransportModes = new Set([transport]);
+  navMode = startProfile;
+  syncTransportCheckboxes();
+  syncNavButtons();
+  if (reachTimeSlider) reachTimeSlider.value = String(Math.min(60, outingMinutes));
+  updateTimeFilterUI();
+  updateFilterSummary();
+  updateOutingPanelState();
+
+  /* Ask for GPS if needed, but never make the user wait long for it. */
+  if (!locationMarker) {
+    if (goBtn) goBtn.textContent = '📍 Getting your location…';
+    try { locateMe(); } catch { /* ignore – falls back to map centre */ }
+    const t0 = Date.now();
+    while (!locationMarker && Date.now() - t0 < 8000) await sleep(150);
+    if (goBtn) goBtn.textContent = 'Weiter →';
+  }
+  closeStartScreen();
+
+  try {
+    await getMeOutOfHere();
+  } finally {
+    if (goBtn) goBtn.disabled = false;
+  }
+}
+
+document.getElementById('startOutingGo')?.addEventListener('click', () => {
+  startOutingFromStartScreen();
+});
+
+/* Show the start screen once the version splash is fading out. */
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(openStartScreen, 2000);
+});
 
 /* ── Startup version splash ──────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', function showVersionSplash() {

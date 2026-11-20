@@ -9,11 +9,13 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 | 🗺 Interactive map | OpenFreeMap vector tiles / MapLibre GL JS |
 | 🌡 Noise heatmap | Blue = quiet, Red = noisy |
 | 🏆 Quietest spots | Top 5 ranked markers on the map |
+| 🚀 Start screen | On launch: "Get me out of here" (pick minutes + walk/bike/car, route straight to the best quiet spot, switch between the top 5 with "Other spot") or normal mode |
 | ⚖️ Adjustable road weights | Tune how much each road type contributes to noise |
 | 🎚 Heatmap controls | Opacity and blur radius sliders |
 | ?? Transportation filters | Car, bike, on foot, climbing, mountaineering, kayaking - reachable within 200 m of an accessible route |
 | ?? Travel-time budget | 5-60 min from your location (or the map centre), effective-speed radius intersected with accessible routes |
 | ?? Filter feedback | Active filter summary, grey-out legend, travel-time radius circle and reachable/not-reachable in the map-click popup |
+| ?? Built-up density | Land use (retail/commercial/residential/...) plus nearby POIs (shops, restaurants, offices) mark crowded places such as shopping streets and town centres; toggle in the sidebar |
 
 ## How it works
 
@@ -31,6 +33,9 @@ A Google Maps-like single-page web app that helps you find the **most silent spo
 5. The quietest cells are re-sampled on a finer sub-grid (7×7), because a 50×50 grid can otherwise only place a sample within half a cell of the true quietest point - which inflates the best score noticeably when zoomed out.
 6. The five most promising points, at least a minimum distance apart, are shown as ranked markers, each with the distance to its loudest noise source.
 7. Below zoom level 12 the tiles only contain motorways and major roads, so the absolute index is not comparable with a detailed analysis. Results are then labelled **coarse data**, prefixed with `~` and accompanied by an explicit hint.
+8. The analysis box is always read at one canonical zoom (the zoom that fits the box, capped at the tile source's max zoom 14), regardless of the current camera. The same origin + radius + travel mode therefore always yields the same spots - previously the result changed with the map zoom because the tiles carry less detail at low zoom.
+9. Built-up density is added as an activity penalty: land-use polygons (retail 4.5, commercial 3.0, industrial 1.4, residential 0.6, ...) and the distance-weighted sum of nearby POIs within 250 m (shops, supermarkets, restaurants, offices, ...). This makes shopping streets, malls and town centres rank worse even when no big road is close. The OpenFreeMap `building` layer is far too sparse for a density estimate and is not used.
+10. "Get me out of here" freezes its origin for the whole session, so a repeated search (after the map jumped to the previous destination) searches the same circle. Each new route in that mode removes the previous spot markers instead of leaving them as faded history.
 
 ## Road noise weights (defaults)
 

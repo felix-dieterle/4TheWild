@@ -148,10 +148,17 @@
           Vegetation (forests, scrubland, wetlands) dampens sound and is
           factored into the heatmap. The terrain layer shows rough tracks and
           demanding hiking routes that indicate low accessibility.
+          Built-up density uses land use (residential, retail, commercial) and
+          nearby POIs (shops, restaurants, offices) to mark crowded places such
+          as shopping streets and town centres.
         </p>
         <label class="toggle-label">
           <input type="checkbox" id="vegDampening" checked />
           Vegetation noise dampening
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="useBuiltUp" checked />
+          Built-up &amp; shopping density (land use + POIs)
         </label>
         <label class="toggle-label">
           <input type="checkbox" id="showTerrain" />
@@ -233,6 +240,7 @@
         <div class="rb-actions">
           <button type="button" id="rbFollow" class="rb-btn">&#129517; Follow</button>
           <button type="button" id="rbSteps" class="rb-btn">&#128203; Steps</button>
+          <button type="button" id="rbNextSpot" class="rb-btn hidden">&#128256; Other spot</button>
           <button type="button" id="rbEnd" class="rb-btn secondary">&#10005; End</button>
         </div>
         <ol id="rbStepList" class="rb-steps hidden"></ol>
@@ -241,6 +249,65 @@
   </div>
   <!-- Mobile sidebar overlay -->
   <div id="sidebarOverlay" class="hidden"></div>
+
+  <!-- ── Start screen: two ways into the app ──────────────────────── -->
+  <div id="startScreen" class="hidden" role="dialog" aria-modal="true"
+       aria-labelledby="startTitle">
+    <div class="ss-card">
+      <img src="logo.svg" class="ss-logo" alt="4TheWild jungle logo" />
+      <h2 id="startTitle">4TheWild</h2>
+      <p class="ss-sub">Silent Place Finder</p>
+
+      <div id="startChoices">
+        <button type="button" id="startOutingBtn" class="ss-choice ss-choice-primary">
+          <span class="ss-choice-icon">&#127807;</span>
+          <span class="ss-choice-text">
+            <b>Get me out of here</b>
+            <small>Best quiet spot &middot; navigation starts right away</small>
+          </span>
+        </button>
+        <button type="button" id="startNormalBtn" class="ss-choice">
+          <span class="ss-choice-icon">&#128506;&#65039;</span>
+          <span class="ss-choice-text">
+            <b>Normalmodus starten</b>
+            <small>Map, analysis and all settings</small>
+          </span>
+        </button>
+      </div>
+
+      <div id="startOutingConfig" class="hidden">
+        <label class="ss-label" for="startCustomMin">How much time do you have?</label>
+        <div class="ss-minutes" role="group" aria-label="Minutes">
+          <button type="button" class="ss-min" data-min="5">5</button>
+          <button type="button" class="ss-min" data-min="10">10</button>
+          <button type="button" class="ss-min active" data-min="15">15</button>
+          <button type="button" class="ss-min" data-min="30">30</button>
+          <button type="button" class="ss-min" data-min="60">60</button>
+        </div>
+        <div class="ss-custom">
+          <input type="number" id="startCustomMin" min="1" max="240" step="1"
+                 inputmode="numeric" placeholder="or any number" />
+          <span>min</span>
+        </div>
+
+        <label class="ss-label">How do you want to travel?</label>
+        <div class="ss-modes" role="group" aria-label="Travel mode">
+          <button type="button" class="ss-mode active" data-profile="foot">
+            <span>&#128694;</span> Walk
+          </button>
+          <button type="button" class="ss-mode" data-profile="cycling">
+            <span>&#128690;</span> Bike
+          </button>
+          <button type="button" class="ss-mode" data-profile="driving">
+            <span>&#128663;</span> Car
+          </button>
+        </div>
+
+        <button type="button" id="startOutingGo">Weiter &rarr;</button>
+        <button type="button" id="startOutingBack" class="ss-back">&larr; Back</button>
+      </div>
+    </div>
+  </div>
 
   <script src="lib/maplibre-gl.js"></script>
   <!-- Version splash shown briefly on startup -->
