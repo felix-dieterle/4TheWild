@@ -1861,7 +1861,21 @@ document.addEventListener('visibilitychange', () => {
  * OSRM provides free turn-by-turn routing based on OpenStreetMap data.
  */
 const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org';
-const OSRM_BASE      = 'https://router.project-osrm.org';
+
+/**
+ * Routing back ends. FOSSGIS runs one OSRM instance per profile behind a path
+ * prefix (routed-car / routed-bike / routed-foot); osrm-routed ignores the
+ * /route/v1/<profile> segment of the URL. The plain project-osrm.org demo only
+ * has the car profile, so asking it for "foot" returns a car route - it is
+ * therefore used as a fallback only, and flagged as such in the UI.
+ */
+const OSRM_BASE          = 'https://routing.openstreetmap.de';
+const OSRM_FALLBACK_BASE = 'https://router.project-osrm.org';
+const OSRM_PROFILE_PREFIX = {
+  driving: 'routed-car',
+  cycling: 'routed-bike',
+  foot:    'routed-foot',
+};
 
 /** Polyline colour for each OSRM travel profile. */
 const NAV_MODE_COLORS = {
@@ -1952,23 +1966,48 @@ async function geocodeAddress(query) {
 }
 
 /**
- * Fetch a route from OSRM between two coordinate pairs.
+ * Fetch a route between two coordinate pairs.
+ *
+ * The profile-specific FOSSGIS instances are queried first (so walking really
+ * uses footways, steps and pedestrian zones). If that host is unreachable the
+ * OSRM demo server is used as a fallback - but it only runs the car profile,
+ * so the result is flagged with `fallback: true` and the ETA is recomputed
+ * from walking/cycling speeds instead of showing car travel times.
+ *
  * @param {number} fromLat  Start latitude
  * @param {number} fromLon  Start longitude
  * @param {number} toLat    End latitude
  * @param {number} toLon    End longitude
- * @param {string} profile  OSRM profile: 'driving' | 'cycling' | 'foot'
- * @returns {Promise<{coordinates:Array,distance:number,duration:number}>}
+ * @param {string} profile  Routing profile: 'driving' | 'cycling' | 'foot'
+ * @returns {Promise<{coordinates:Array,distance:number,duration:number,
+ *                    steps:Array,profile:string,fallback:boolean}>}
  */
 async function fetchRoute(fromLat, fromLon, toLat, toLon, profile) {
-  const coords = `${fromLon},${fromLat};${toLon},${toLat}`;
-  const url = `${OSRM_BASE}/route/v1/${profile}/${coords}?overview=full&geometries=geojson&steps=true`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Routing request failed (HTTP ${resp.status})`);
-  const data = await resp.json();
-  if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
-    throw new Error('No route found for the given locations.');
+  const coords  = `${fromLon},${fromLat};${toLon},${toLat}`;
+  const query   = 'overview=full&geometries=geojson&steps=true';
+  const prefix  = OSRM_PROFILE_PREFIX[profile] || OSRM_PROFILE_PREFIX.driving;
+
+  let data = null;
+  let fallback = false;
+
+  try {
+    const resp = await fetch(`${OSRM_BASE}/${prefix}/route/v1/driving/${coords}?${query}`);
+    if (!resp.ok) throw new Error(`Routing request failed (HTTP ${resp.status})`);
+    data = await resp.json();
+    if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
+      throw new Error('No route found for the given locations.');
+    }
+  } catch (primaryErr) {
+    if (profile === 'driving') throw primaryErr;
+    const resp = await fetch(`${OSRM_FALLBACK_BASE}/route/v1/driving/${coords}?${query}`);
+    if (!resp.ok) throw new Error(`Routing request failed (HTTP ${resp.status})`);
+    data = await resp.json();
+    if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
+      throw new Error('No route found for the given locations.');
+    }
+    fallback = true;
   }
+
   const route = data.routes[0];
 
   /* A zero-length route means the router snapped both points onto the same
@@ -1993,11 +2032,30 @@ async function fetchRoute(fromLat, fromLon, toLat, toLon, profile) {
     });
   });
 
+  let distance = route.distance;
+  let duration = route.duration;
+
+  /* Car-profile fallback for a walking/cycling request: replace the car ETA
+   * and step timings with the effective speed of the selected mode. */
+  if (fallback && profile !== 'driving') {
+    const speedKmh = profile === 'cycling' ? MODE_EFFECTIVE_KMH.bike
+                   : profile === 'foot'    ? MODE_EFFECTIVE_KMH.foot
+                   :                         MODE_EFFECTIVE_KMH.car;
+    const est = distance / (speedKmh * 1000 / 3600);
+    if (est > 0) {
+      const scale = route.duration > 0 ? est / route.duration : 1;
+      steps.forEach((st) => { st.duration *= scale; });
+      duration = est;
+    }
+  }
+
   return {
     coordinates: route.geometry.coordinates, /* [lon, lat] pairs */
-    distance:    route.distance,             /* metres            */
-    duration:    route.duration,             /* seconds           */
+    distance,                                /* metres            */
+    duration,                                /* seconds           */
     steps,
+    profile,
+    fallback,
   };
 }
 
@@ -2427,7 +2485,12 @@ async function calculateRoute() {
       destLng: dest.lon,
       follow: !!locationMarker,
     });
-    showNavStatus('✅ Route active – mini navigation is running on the map.', 'success');
+    showNavStatus(
+      route.fallback
+        ? '⚠️ Walking/cycling router unreachable – showing a car-road route instead.'
+        : '✅ Route active – mini navigation is running on the map.',
+      route.fallback ? 'error' : 'success'
+    );
 
   } catch (err) {
     console.warn('Navigation error:', err.message);
@@ -2517,7 +2580,12 @@ async function navigateToCoords(lat, lng, label, opts = {}) {
       destLng: lng,
       follow: !!locationMarker,
     });
-    showNavStatus('✅ Route active – mini navigation is running on the map.', 'success');
+    showNavStatus(
+      route.fallback
+        ? '⚠️ Walking/cycling router unreachable – showing a car-road route instead.'
+        : '✅ Route active – mini navigation is running on the map.',
+      route.fallback ? 'error' : 'success'
+    );
 
   } catch (err) {
     console.warn('Navigation error:', err.message);

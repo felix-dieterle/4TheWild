@@ -65,10 +65,13 @@ The basemap and all analysed road/railway/landcover data come from
 - the app reads the tiles that are already loaded, so **no Overpass API calls**
   are made and no separate road-data service is needed
 
-Nominatim (geocoding) and the public OSRM demo server (routing) are used only
-for the optional navigation feature and for light, interactive use. For a
-production release with heavy traffic, self-host them or use a commercial
-provider with a usage agreement.
+Nominatim (geocoding) and the FOSSGIS OSRM instances
+([routing.openstreetmap.de](https://routing.openstreetmap.de/): `routed-car`,
+`routed-bike`, `routed-foot`) are used only for the optional navigation feature
+and for light, interactive use. The plain `router.project-osrm.org` demo runs
+**only the car profile** and ignores the profile segment in the URL, so it is
+used solely as a fallback. For a production release with heavy traffic,
+self-host these services or use a commercial provider with a usage agreement.
 
 ## Usage
 
